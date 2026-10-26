@@ -62,7 +62,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	r := app.NewRouter(s, app.Options{EnableLogging: true})
+	r := app.RateLimit(app.NewRouter(s, app.Options{EnableLogging: true}))
 
 	srv := &http.Server{
 		Addr:    *addr,

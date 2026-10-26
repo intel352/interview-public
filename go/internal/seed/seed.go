@@ -89,7 +89,7 @@ func seedFiles(ctx context.Context, s *store.Store, rng *mrand.Rand, count int) 
 		50 * 1024 * 1024, // 50MB
 	}
 
-	for i := 0; i < count; i++ {
+	for i := range count {
 		size := sizes[rng.IntN(len(sizes))]
 		f := &store.File{
 			ID:          fmt.Sprintf("file-%04d", i+1),
@@ -117,7 +117,7 @@ func seedActivity(ctx context.Context, s *store.Store, fake *gofakeit.Faker, rng
 	actions := []string{"create", "update", "delete", "view", "export", "import"}
 	resources := []string{"contact", "file", "report"}
 
-	for i := 0; i < 5000; i++ {
+	for range 5000 {
 		user := users[rng.IntN(len(users))]
 		action := actions[rng.IntN(len(actions))]
 		resource := resources[rng.IntN(len(resources))]

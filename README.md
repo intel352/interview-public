@@ -13,6 +13,8 @@ Both implementations share the same SQLite database schema and provide identical
 
 ### Go
 
+Requires Go **1.27.3** or newer (`go version`).
+
 ```bash
 cd go
 make seed   # Seed the database with test data
@@ -54,6 +56,54 @@ curl -H "Authorization: Bearer user@example.com" http://localhost:8080/api/conta
 ```
 
 The token should be a valid email address. It serves as the user identifier.
+
+## Request limiting (Go)
+
+The Go server applies one **process-local leaky bucket** shared by every client
+and route, including `/health`, unauthenticated requests, and requests that fail.
+It admits at most **10 requests per minute** by draining one request every six
+seconds. The Java implementation is unchanged.
+
+Assumptions and behavior:
+
+- **Capacity: one request.** The first request passes immediately. Another can
+  pass exactly six seconds later. Idle time does not accumulate burst capacity.
+- **Overflow: reject immediately.** A full bucket returns `429 Too Many Requests`,
+  `Content-Type: application/json`, and `{"error":"rate limit exceeded"}`. No
+  requests are queued or delayed. This is leaky-bucket policing, not a queued
+  traffic shaper.
+- `Retry-After` is the remaining drain time rounded up to whole seconds. It is
+  advisory: another client may take the next available slot. Rejected requests
+  add no work and do not postpone the next admission.
+- Limiting runs before routing and authentication, so `429` takes precedence
+  while the bucket is full. Even a health check consumes the shared allowance.
+
+The bucket stores pending work as a duration. Each admitted request adds six
+seconds; elapsed time drains it down to zero. A mutex makes draining and admission
+atomic across clients. The clock is read under that lock, and handlers execute
+after it is released. Production uses Go's monotonic clock through `time.Now`;
+tests inject time so boundaries do not need sleeps. No background worker or new
+dependency is needed.
+
+This limits admissions, not simultaneous in-flight work: slow handlers can
+overlap. There is no per-client fairness, state resets on restart, and separate
+server processes have independent limits. A larger burst capacity would change
+the strict spacing policy; per-client or distributed limits would require a
+different state scope. The server creates the wrapper once in `cmd/server`;
+`NewRouter` remains reusable without limiting so the existing benchmarks continue
+to measure CRM handlers.
+
+Run the tests from `go/`:
+
+```bash
+go test ./...
+go test -race ./...
+go vet ./...
+```
+
+Coverage includes exact six-second boundaries, fractional `Retry-After` rounding,
+idle and backward-clock behavior, concurrent clients sharing one bucket, all-route
+coverage, and rejected writes leaving the real SQLite store unchanged.
 
 ## Endpoints
 
