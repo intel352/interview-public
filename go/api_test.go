@@ -23,17 +23,21 @@ var (
 )
 
 func TestMain(m *testing.M) {
+	os.Exit(runTests(m))
+}
+
+func runTests(m *testing.M) int {
 	dir, err := os.MkdirTemp("", "interview-test-*")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to create temp dir: %v\n", err)
-		os.Exit(1)
+		return 1
 	}
 	defer os.RemoveAll(dir)
 
 	testStore, err = store.New(dir)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to create store: %v\n", err)
-		os.Exit(1)
+		return 1
 	}
 	defer testStore.Close()
 
@@ -44,14 +48,14 @@ func TestMain(m *testing.M) {
 	seed.SetQuiet(true)
 	if err := seed.Run(context.Background(), testStore, opts); err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to seed: %v\n", err)
-		os.Exit(1)
+		return 1
 	}
 
 	r := app.NewRouter(testStore, app.Options{EnableLogging: false})
 	testServer = httptest.NewServer(r)
 	defer testServer.Close()
 
-	os.Exit(m.Run())
+	return m.Run()
 }
 
 func authedRequest(method, path string, body io.Reader) *http.Request {

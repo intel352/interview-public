@@ -12,6 +12,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/go-chi/chi/v5/middleware"
+
 	"github.com/weave-lab/interview-public/go/internal/app"
 	"github.com/weave-lab/interview-public/go/internal/seed"
 	"github.com/weave-lab/interview-public/go/internal/store"
@@ -62,7 +64,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	r := app.RateLimit(app.NewRouter(s, app.Options{EnableLogging: true}))
+	r := middleware.Logger(app.RateLimit(app.NewRouter(s, app.Options{})))
 
 	srv := &http.Server{
 		Addr:    *addr,

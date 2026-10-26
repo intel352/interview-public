@@ -182,7 +182,11 @@ func TestRateLimitRouterWrites(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { s.Close() })
+	t.Cleanup(func() {
+		if err := s.Close(); err != nil {
+			t.Errorf("close store: %v", err)
+		}
+	})
 	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	h := rateLimit(NewRouter(s, Options{}), func() time.Time { return now })
 	for i, want := range []int{http.StatusCreated, http.StatusTooManyRequests} {

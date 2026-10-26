@@ -40,7 +40,8 @@ func rateLimit(next http.Handler, now func() time.Time) http.Handler {
 			w.Header().Set("Retry-After", strconv.FormatInt(int64(seconds), 10))
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusTooManyRequests)
-			w.Write([]byte("{\"error\":\"rate limit exceeded\"}\n"))
+			// The status is committed; a failed body write cannot change the response.
+			_, _ = w.Write([]byte("{\"error\":\"rate limit exceeded\"}\n"))
 			return
 		}
 		next.ServeHTTP(w, r)
