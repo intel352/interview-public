@@ -1,13 +1,13 @@
 # CRM API Server
 
-A simple CRM-style API server for managing contacts and files. Available in both Go and Java implementations with identical API interfaces.
+A simple CRM-style API server for managing contacts and files. Available in both Go and Java implementations with the same core API routes.
 
 ## Implementations
 
 - **Go**: Located in `go/` directory
 - **Java**: Located in `java/` directory (Spring Boot)
 
-Both implementations share the same SQLite database schema and provide identical REST API endpoints.
+Both implementations share the SQLite schema and core REST endpoints. The Go version adds local-demo security and stricter validation; see [Go hardening](go/HARDENING.md) for its compatibility changes and design.
 
 ## Quick Start
 
@@ -45,17 +45,31 @@ cd java
 ./mvnw spring-boot:run
 ```
 
-The server runs on `http://localhost:8080` by default.
+The Go server listens on `http://127.0.0.1:8080` by default and accepts only numeric loopback bind addresses. Java retains its original configuration.
 
 ## Authentication
 
-All `/api/*` endpoints require a bearer token in the `Authorization` header:
+### Go: one local workspace
+
+At startup, the server prints a fresh random bearer token **after** successfully
+binding to loopback. Copy it from that private terminal into a shell variable:
 
 ```bash
-curl -H "Authorization: Bearer user@example.com" http://localhost:8080/api/contacts
+read -r -s TOKEN   # Paste the startup token, then press Enter
+curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/api/contacts
 ```
 
-The token should be a valid email address. It serves as the user identifier.
+All authenticated clients have full access to one shared workspace and use the
+principal `local-demo`. This is a local demonstration, not a multi-user identity
+system. The token exists only in memory, expires on restart, and is never written
+to the data directory or access logs. Keep startup output private and run
+`unset TOKEN` when finished. Email addresses no longer authenticate requests.
+`POST /api/auth/token` checks the current credential; it does not issue tokens.
+
+### Java
+
+Java is unchanged: it accepts a valid email address as its demo bearer token,
+for example `Authorization: Bearer user@example.com`.
 
 ## Request limiting (Go)
 
@@ -130,7 +144,7 @@ coverage, and rejected writes leaving the real SQLite store unchanged.
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/api/files` | List files |
-| `POST` | `/api/files` | Upload a file (multipart form, max 100MB) |
+| `POST` | `/api/files` | Upload a file (multipart form, max 100 MiB file) |
 | `GET` | `/api/files/:id` | Download a file |
 
 ### Reports
@@ -153,37 +167,39 @@ The `/api/contacts` endpoint uses cursor-based pagination. The response includes
 Pass the token as a query parameter to fetch the next page:
 
 ```bash
-curl -H "Authorization: Bearer user@example.com" \
-  "http://localhost:8080/api/contacts?page_token=eyJjcmVhdGVkX2F0Ijoi..."
+curl -H "Authorization: Bearer $TOKEN" \
+  "http://127.0.0.1:8080/api/contacts?page_token=eyJjcmVhdGVkX2F0Ijoi..."
 ```
 
-## Examples
+## Examples (Go)
+
+Use the startup `TOKEN` above. Leave at least six seconds between requests, or honor `Retry-After`. JSON mutations require `Content-Type: application/json`.
 
 ```bash
 # List contacts (first page)
-curl -H "Authorization: Bearer user@example.com" \
-  http://localhost:8080/api/contacts?limit=10
+curl -H "Authorization: Bearer $TOKEN" \
+  "http://127.0.0.1:8080/api/contacts?limit=10"
 
 # Create a contact
-curl -X POST -H "Authorization: Bearer user@example.com" \
+curl -X POST -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"first_name":"Jane","last_name":"Doe","email":"jane@example.com","phone":"555-1234","company":"Acme"}' \
-  http://localhost:8080/api/contacts
+  http://127.0.0.1:8080/api/contacts
 
 # Upload a file
-curl -X POST -H "Authorization: Bearer user@example.com" \
+curl -X POST -H "Authorization: Bearer $TOKEN" \
   -F "file=@/path/to/file.pdf" \
-  http://localhost:8080/api/files
+  http://127.0.0.1:8080/api/files
 
 # Bulk import
-curl -X POST -H "Authorization: Bearer user@example.com" \
+curl -X POST -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '[{"first_name":"A","last_name":"B","email":"a@b.com","phone":"555","company":"X"}]' \
-  http://localhost:8080/api/contacts/import
+  http://127.0.0.1:8080/api/contacts/import
 
 # Export contacts
-curl -H "Authorization: Bearer user@example.com" \
-  http://localhost:8080/api/contacts/export > contacts.csv
+curl -H "Authorization: Bearer $TOKEN" \
+  http://127.0.0.1:8080/api/contacts/export > contacts.csv
 ```
 
 ## Seeding Options
@@ -225,7 +241,7 @@ make bench
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--addr` | `:8080` | Server listen address |
+| `--addr` | `127.0.0.1:8080` | Numeric loopback address only (IPv4 or IPv6) |
 | `--data` | `data` | Data directory for database and files |
 | `--seed` | `false` | Seed database with test data |
 | `--contacts` | `10000` | Number of contacts to seed |

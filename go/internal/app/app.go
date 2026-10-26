@@ -1,6 +1,7 @@
 package app
 
 import (
+	"log"
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
@@ -13,6 +14,7 @@ import (
 
 type Options struct {
 	EnableLogging bool
+	AuthToken     string
 }
 
 func NewRouter(s *store.Store, opts Options) http.Handler {
@@ -23,10 +25,12 @@ func NewRouter(s *store.Store, opts Options) http.Handler {
 		r.Use(middleware.Logger)
 	}
 	r.Use(middleware.Recoverer)
-	r.Use(auth.TokenParser)
+	r.Use(auth.TokenParser(opts.AuthToken))
 
 	r.Get("/health", func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("ok"))
+		if _, err := w.Write([]byte("ok")); err != nil {
+			log.Printf("write health response: %v", err)
+		}
 	})
 
 	r.Route("/api", func(r chi.Router) {

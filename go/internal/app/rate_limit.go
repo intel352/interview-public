@@ -1,6 +1,7 @@
 package app
 
 import (
+	"log"
 	"net/http"
 	"strconv"
 	"sync"
@@ -39,9 +40,13 @@ func rateLimit(next http.Handler, now func() time.Time) http.Handler {
 			seconds := (retryAfter + time.Second - 1) / time.Second
 			w.Header().Set("Retry-After", strconv.FormatInt(int64(seconds), 10))
 			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Cache-Control", "no-store")
 			w.WriteHeader(http.StatusTooManyRequests)
-			// The status is committed; a failed body write cannot change the response.
-			_, _ = w.Write([]byte("{\"error\":\"rate limit exceeded\"}\n"))
+			// Abort an interrupted response; its status is already committed.
+			if _, err := w.Write([]byte("{\"error\":\"rate limit exceeded\"}\n")); err != nil {
+				log.Print("write rate limit response failed")
+				panic(http.ErrAbortHandler)
+			}
 			return
 		}
 		next.ServeHTTP(w, r)

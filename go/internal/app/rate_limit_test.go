@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -14,6 +15,27 @@ import (
 
 	"github.com/weave-lab/interview-public/go/internal/store"
 )
+
+type failedResponseWriter struct{ *httptest.ResponseRecorder }
+
+func (w failedResponseWriter) Write([]byte) (int, error) {
+	return 0, errors.New("synthetic response failure")
+}
+
+func TestRateLimitAbortsInterruptedRejection(t *testing.T) {
+	h := rateLimit(http.NotFoundHandler(), func() time.Time { return time.Time{} })
+	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/", nil))
+	w := failedResponseWriter{httptest.NewRecorder()}
+	defer func() {
+		if got := recover(); got != http.ErrAbortHandler {
+			t.Errorf("panic = %v, want response abort", got)
+		}
+		if w.Code != http.StatusTooManyRequests {
+			t.Errorf("status = %d, want 429", w.Code)
+		}
+	}()
+	h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/", nil))
+}
 
 func TestRateLimitDrainBoundaries(t *testing.T) {
 	start := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
@@ -48,6 +70,9 @@ func TestRateLimitDrainBoundaries(t *testing.T) {
 			t.Fatalf("at %s: got status %d, Retry-After %q; want %d, %q", tt.at, w.Code, w.Header().Get("Retry-After"), tt.code, tt.retry)
 		}
 		if tt.code == http.StatusTooManyRequests {
+			if w.Header().Get("Cache-Control") != "no-store" {
+				t.Fatal("rejection must not be cached")
+			}
 			if w.Header().Get("Content-Type") != "application/json" || w.Body.String() != "{\"error\":\"rate limit exceeded\"}\n" {
 				t.Fatalf("unexpected rejection: headers=%v body=%q", w.Header(), w.Body.String())
 			}
@@ -178,6 +203,7 @@ func TestRateLimitRejectsWhileHandlerIsBusy(t *testing.T) {
 }
 
 func TestRateLimitRouterWrites(t *testing.T) {
+	const token = "test-only-rate-limit-token"
 	s, err := store.New(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -188,10 +214,12 @@ func TestRateLimitRouterWrites(t *testing.T) {
 		}
 	})
 	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-	h := rateLimit(NewRouter(s, Options{}), func() time.Time { return now })
+	h := rateLimit(NewRouter(s, Options{AuthToken: token}), func() time.Time { return now })
 	for i, want := range []int{http.StatusCreated, http.StatusTooManyRequests} {
 		r := httptest.NewRequest(http.MethodPost, "/api/contacts", strings.NewReader(`{"first_name":"Test","email":"test@example.com"}`))
-		r.Header.Set("Authorization", fmt.Sprintf("Bearer user%d@example.com", i))
+		r.Header.Set("Authorization", "Bearer "+token)
+		r.Header.Set("Content-Type", "application/json")
+		r.RemoteAddr = fmt.Sprintf("127.0.0.%d:1234", i+1)
 		w := httptest.NewRecorder()
 		h.ServeHTTP(w, r)
 		if w.Code != want {
@@ -204,7 +232,7 @@ func TestRateLimitRouterWrites(t *testing.T) {
 	}
 	now = now.Add(6 * time.Second)
 	r := httptest.NewRequest(http.MethodGet, "/api/contacts", nil)
-	r.Header.Set("Authorization", "Bearer another@example.com")
+	r.Header.Set("Authorization", "Bearer "+token)
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, r)
 	var body struct{ Contacts []store.Contact }
@@ -214,8 +242,9 @@ func TestRateLimitRouterWrites(t *testing.T) {
 }
 
 func TestRateLimitIncludesHealthAuthAndUnknownRoutes(t *testing.T) {
+	const token = "test-only-rate-limit-token"
 	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-	h := rateLimit(NewRouter(nil, Options{}), func() time.Time { return now })
+	h := rateLimit(NewRouter(nil, Options{AuthToken: token}), func() time.Time { return now })
 	for _, tt := range []struct {
 		advance time.Duration
 		method  string
@@ -227,7 +256,7 @@ func TestRateLimitIncludesHealthAuthAndUnknownRoutes(t *testing.T) {
 		{0, "GET", "/api/contacts", "", 429},
 		{6 * time.Second, "GET", "/api/contacts", "", 401},
 		{0, "GET", "/health", "", 429},
-		{6 * time.Second, "POST", "/api/auth/token", "Bearer user@example.com", 200},
+		{6 * time.Second, "POST", "/api/auth/token", "Bearer " + token, 200},
 		{0, "GET", "/missing", "", 429},
 		{6 * time.Second, "GET", "/missing", "", 404},
 		{0, "GET", "/health", "", 429},

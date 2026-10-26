@@ -71,7 +71,7 @@ func seedContacts(ctx context.Context, s *store.Store, fake *gofakeit.Faker, cou
 				Company:   fake.Company(),
 			})
 		}
-		if _, err := s.ImportContacts(ctx, batch); err != nil {
+		if _, err := s.ImportContacts(ctx, "seed", batch); err != nil {
 			return err
 		}
 		logger.Printf("Seeded %d/%d contacts", min(i+batchSize, count), count)
@@ -98,7 +98,7 @@ func seedFiles(ctx context.Context, s *store.Store, rng *mrand.Rand, count int) 
 		}
 
 		content := io.LimitReader(rand.Reader, size)
-		if err := s.CreateFile(ctx, f, content); err != nil {
+		if err := s.CreateFile(ctx, "seed", f, content); err != nil {
 			return err
 		}
 		logger.Printf("Seeded file %d/%d (%d bytes)", i+1, count, size)
