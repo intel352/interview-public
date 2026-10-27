@@ -7,7 +7,7 @@ A simple CRM-style API server for managing contacts and files. Available in both
 - **Go**: Located in `go/` directory
 - **Java**: Located in `java/` directory (Spring Boot)
 
-Both implementations share the SQLite schema and core REST endpoints. The Go version adds local-demo security and stricter validation; see [Go hardening](go/HARDENING.md) for its compatibility changes and design.
+Both implementations provide the core CRM routes. Go now has actor-owned data, a separate health listener and stricter validation; its database schema is no longer interchangeable with Java. See [Go hardening](go/HARDENING.md), [API testing](go/API_TESTING.md) and [compatibility review](go/COMPATIBILITY.md). Java is unchanged.
 
 ## Quick Start
 
@@ -17,7 +17,7 @@ Requires Go **1.27.3** or newer (`go version`).
 
 ```bash
 cd go
-make seed   # Seed the database with test data
+make seed   # Optional: seed actor-owned synthetic data
 make run    # Start the server
 ```
 
@@ -45,26 +45,40 @@ cd java
 ./mvnw spring-boot:run
 ```
 
-The Go server listens on `http://127.0.0.1:8080` by default and accepts only numeric loopback bind addresses. Java retains its original configuration.
+Go serves the business API at `http://127.0.0.1:8080` and public liveness at `http://127.0.0.1:8081/health`. Both accept only numeric loopback addresses. A fresh empty database is usable without seeding. Java retains its original configuration.
 
 ## Authentication
 
-### Go: one local workspace
+### Go: configured local actors
 
-At startup, the server prints a fresh random bearer token **after** successfully
-binding to loopback. Copy it from that private terminal into a shell variable:
+At startup, the server prints an independent random bearer token for each actor
+**after both listeners bind**. The defaults are `alice@example.com` and
+`bob@example.com`. Configure explicit labels with, for example:
 
 ```bash
-read -r -s TOKEN   # Paste the startup token, then press Enter
+go run ./cmd/server --actors=alice@example.com,bob@example.com
+```
+
+Labels are case-sensitive local configuration, not verified email identities.
+Copy one actor's token from the private startup terminal:
+
+```bash
+read -r -s TOKEN   # Paste that actor's token, then press Enter
 curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/api/contacts
 ```
 
-All authenticated clients have full access to one shared workspace and use the
-principal `local-demo`. This is a local demonstration, not a multi-user identity
-system. The token exists only in memory, expires on restart, and is never written
-to the data directory or access logs. Keep startup output private and run
-`unset TOKEN` when finished. Email addresses no longer authenticate requests.
-`POST /api/auth/token` checks the current credential; it does not issue tokens.
+Each credential carries its actor into contact/file ownership and audit rows.
+Lists, individual resources, imports, exports, files and reports are restricted
+to that actor. Another actor's resource ID returns the same `404` as a missing ID.
+Tokens stay in memory, change on restart, and are absent from data/access logs.
+`POST /api/auth/token` returns the authenticated `user_id`; it does not issue tokens.
+Keep startup output private and run `unset TOKEN` when finished. An email label
+alone never authenticates. The local operator can see every startup credential;
+this is a local demonstration, not an external identity provider.
+
+Legacy shared databases are rejected without automatic ownership assignment.
+Keep the old directory intact and use a fresh `--data` directory. See the
+[compatibility and migration policy](go/COMPATIBILITY.md).
 
 ### Java
 
@@ -74,7 +88,7 @@ for example `Authorization: Bearer user@example.com`.
 ## Request limiting (Go)
 
 The Go server applies one **process-local leaky bucket** shared by every client
-and route, including `/health`, unauthenticated requests, and requests that fail.
+on the business listener, including unauthenticated, unknown-route and failed requests. The separate health listener bypasses this limiter.
 It admits at most **10 requests per minute** by draining one request every six
 seconds. The Java implementation is unchanged.
 
@@ -90,7 +104,7 @@ Assumptions and behavior:
   advisory: another client may take the next available slot. Rejected requests
   add no work and do not postpone the next admission.
 - Limiting runs before routing and authentication, so `429` takes precedence
-  while the bucket is full. Even a health check consumes the shared allowance.
+  while the bucket is full. Health probes on the separate health listener remain available and never consume the API allowance.
 
 The bucket stores pending work as a duration. Each admitted request adds six
 seconds; elapsed time drains it down to zero. A mutex makes draining and admission
@@ -116,8 +130,7 @@ go vet ./...
 ```
 
 Coverage includes exact six-second boundaries, fractional `Retry-After` rounding,
-idle and backward-clock behavior, concurrent clients sharing one bucket, all-route
-coverage, and rejected writes leaving the real SQLite store unchanged.
+idle and backward-clock behavior, concurrent authenticated actors sharing one bucket, health isolation, and rejected writes leaving the real SQLite store unchanged.
 
 ## Endpoints
 
@@ -125,7 +138,13 @@ coverage, and rejected writes leaving the real SQLite store unchanged.
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/health` | Health check (no auth required) |
+| `GET` | `/health` | Public liveness on the health listener only; no database readiness claim |
+
+### Authentication (Go business listener)
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/api/auth/token` | Verify the current actor credential |
 
 ### Contacts
 
@@ -137,7 +156,7 @@ coverage, and rejected writes leaving the real SQLite store unchanged.
 | `PUT` | `/api/contacts/:id` | Update a contact |
 | `DELETE` | `/api/contacts/:id` | Delete a contact |
 | `POST` | `/api/contacts/import` | Bulk import contacts (JSON array, max 10k) |
-| `GET` | `/api/contacts/export` | Export all contacts as CSV |
+| `GET` | `/api/contacts/export` | Export this actor's contacts as spreadsheet-safe CSV |
 
 ### Files
 
@@ -151,7 +170,7 @@ coverage, and rejected writes leaving the real SQLite store unchanged.
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/api/reports/activity` | Activity report (last 30 days by default) |
+| `GET` | `/api/reports/activity` | This actor's report (last 30 UTC days by default; optional `since=YYYY-MM-DD`) |
 
 ## Pagination
 
@@ -171,9 +190,14 @@ curl -H "Authorization: Bearer $TOKEN" \
   "http://127.0.0.1:8080/api/contacts?page_token=eyJjcmVhdGVkX2F0Ijoi..."
 ```
 
+Pagination is a live descending `(created_at, id)` walk, not a snapshot. A cursor
+is scoped to its actor, still works if its anchor is deleted, and omits new rows
+inserted before that position. Do not reuse another actor's cursor. Empty lists
+are arrays; the final page omits `next_page_token`.
+
 ## Examples (Go)
 
-Use the startup `TOKEN` above. Leave at least six seconds between requests, or honor `Retry-After`. JSON mutations require `Content-Type: application/json`.
+Use the startup `TOKEN` above. Leave at least six seconds between requests, or honor `Retry-After`. JSON mutations require `Content-Type: application/json`. Send only the five writable contact fields shown below; `PUT` replaces omitted fields with empty strings. Metadata such as `id`, `owner_id` and timestamps is read-only. [API testing](go/API_TESTING.md) includes a safe read-modify-write example.
 
 ```bash
 # List contacts (first page)
@@ -202,16 +226,20 @@ curl -H "Authorization: Bearer $TOKEN" \
   http://127.0.0.1:8080/api/contacts/export > contacts.csv
 ```
 
+CSV protects spreadsheet cells and may prefix values such as `+15551234` with an apostrophe. It is not a lossless backup. Use paginated JSON to obtain exact stored text and full timestamp precision.
+
 ## Seeding Options
 
 ### Go
 
 ```bash
 cd go
-make seed                                      # Default: 10k contacts, 20 files
+make seed                                      # Default totals: 10k contacts, 20 files across configured actors
 go run ./cmd/server --seed --contacts=50000    # Custom contact count
 go run ./cmd/server --seed --files=100         # Custom file count
 ```
+
+Seeding commits contacts, file metadata, activity and a completion marker together. A completed seed is a no-op on repetition; contact count is not an initialization marker. Zero-contact seeds and empty databases can serve normally. Ordinary failure/cancellation rolls back seed rows and cleans up owned files; retry is safe. Power-loss filesystem recovery is a separate limitation.
 
 ### Java
 
@@ -242,10 +270,14 @@ make bench
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--addr` | `127.0.0.1:8080` | Numeric loopback address only (IPv4 or IPv6) |
-| `--data` | `data` | Data directory for database and files |
+| `--health-addr` | API port + 1 | Separate numeric loopback liveness address; API port `0` uses a second ephemeral port |
+| `--actors` | `alice@example.com,bob@example.com` | 1–64 case-sensitive actor labels; independent ephemeral credentials |
+| `--data` | `data` | Actor-owned database and files; legacy shared schemas rejected |
 | `--seed` | `false` | Seed database with test data |
 | `--contacts` | `10000` | Number of contacts to seed |
 | `--files` | `20` | Number of files to seed |
+
+API port `65535` requires an explicit health address; colliding listeners fail startup before credential output. IPv6 loopback is supported, for example `--addr='[::1]:8080'`. Both listeners drain and close together on shutdown or server failure.
 
 ### Java
 
@@ -256,3 +288,5 @@ Configuration is in `src/main/resources/application.properties`:
 | `server.port` | `8080` | Server listen port |
 | `app.data-dir` | `data` | Data directory for database and files |
 | `app.max-upload-size` | `104857600` | Max file upload size (100MB) |
+
+Run `make test-api`, `make test-bdd` or `make test-race` from `go/` for isolated native API testing; no manually managed server or credentials are needed. The [coverage matrix](go/API_TESTING.md#coverage-matrix) names the scenarios and exclusions.

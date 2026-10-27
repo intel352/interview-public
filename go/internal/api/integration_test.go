@@ -31,11 +31,14 @@ func testAPI(t *testing.T) (http.Handler, *store.Store, string) {
 			t.Error(err)
 		}
 	})
+	if err := s.RegisterActors(t.Context(), []string{"alice@example.com"}); err != nil {
+		t.Fatal(err)
+	}
 	token, err := auth.NewToken()
 	if err != nil {
 		t.Fatal(err)
 	}
-	return app.NewRouter(s, app.Options{AuthToken: token}), s, token
+	return app.NewRouter(s, app.Options{AuthTokens: map[string]string{token: "alice@example.com"}}), s, token
 }
 
 func request(h http.Handler, token, method, path, contentType string, body io.Reader) *httptest.ResponseRecorder {
@@ -63,14 +66,14 @@ func TestContactMutationAuditIsAtomicAndNotDuplicated(t *testing.T) {
 		t.Fatalf("delete status=%d body=%s", w.Code, w.Body.String())
 	}
 	var logs int
-	if err := s.DB().QueryRow(`SELECT COUNT(*) FROM activity_log WHERE user_id = 'local-demo'`).Scan(&logs); err != nil || logs != 3 {
+	if err := s.DB().QueryRow(`SELECT COUNT(*) FROM activity_log WHERE user_id = 'alice@example.com'`).Scan(&logs); err != nil || logs != 3 {
 		t.Fatalf("audit rows=%d, want exactly3; err=%v", logs, err)
 	}
 	if _, err := s.DB().Exec(`CREATE TRIGGER reject_audit BEFORE INSERT ON activity_log BEGIN SELECT RAISE(FAIL, 'synthetic failure'); END`); err != nil {
 		t.Fatal(err)
 	}
 	w = request(h, token, "POST", "/api/contacts", "application/json", strings.NewReader(`{"first_name":"Must roll back"}`))
-	count, err := s.CountContacts(context.Background())
+	count, err := s.CountContacts(context.Background(), "alice@example.com")
 	if w.Code != 500 || err != nil || count != 0 {
 		t.Fatalf("failed audit: status=%d contacts=%d err=%v", w.Code, count, err)
 	}
@@ -86,13 +89,13 @@ func TestImportValidationPrecedesAllWrites(t *testing.T) {
 	h, s, token := testAPI(t)
 	for _, body := range []string{`[{"first_name":"First"},{"unknown":"bad"}]`, `[{"first_name":"First"}] {}`} {
 		w := request(h, token, "POST", "/api/contacts/import", "application/json", strings.NewReader(body))
-		count, err := s.CountContacts(context.Background())
+		count, err := s.CountContacts(context.Background(), "alice@example.com")
 		if w.Code != 400 || err != nil || count != 0 {
 			t.Fatalf("status=%d count=%d err=%v body=%s", w.Code, count, err, w.Body.String())
 		}
 	}
 	w := request(h, token, "POST", "/api/contacts/import", "application/json", strings.NewReader(`[{"first_name":"One"},{"first_name":"Two"}]`))
-	count, err := s.CountContacts(context.Background())
+	count, err := s.CountContacts(context.Background(), "alice@example.com")
 	if w.Code != 200 || err != nil || count != 2 {
 		t.Fatalf("valid import: status=%d count=%d err=%v", w.Code, count, err)
 	}
@@ -113,7 +116,7 @@ func TestCSVExportNeutralizesFormulaWithoutChangingStoredValue(t *testing.T) {
 	if err != nil || w.Code != 200 || len(rows) != 2 || rows[1][1] != "' =1+1" || rows[1][2] != "Normal" || rows[1][4] != "'+15551234" {
 		t.Fatalf("CSV status=%d rows=%v err=%v", w.Code, rows, err)
 	}
-	contacts, err := s.ListContacts(context.Background(), 1, nil)
+	contacts, err := s.ListContacts(context.Background(), "alice@example.com", 1, nil)
 	if err != nil || len(contacts) != 1 || contacts[0].FirstName != " =1+1" {
 		t.Fatalf("stored value changed: %+v %v", contacts, err)
 	}
@@ -183,7 +186,7 @@ func TestUploadRejectsInvalidFormsBeforeStorage(t *testing.T) {
 			t.Fatalf("invalid upload status=%d body=%s", w.Code, w.Body.String())
 		}
 	}
-	files, err := s.ListFiles(context.Background())
+	files, err := s.ListFiles(context.Background(), "alice@example.com")
 	if err != nil || len(files) != 0 {
 		t.Fatalf("invalid uploads persisted files=%v err=%v", files, err)
 	}
@@ -225,7 +228,7 @@ func (w *failedResponse) Write([]byte) (int, error) {
 func TestFailedResponsesAbortInsteadOfCompletingPartialBodies(t *testing.T) {
 	h, s, token := testAPI(t)
 	file := store.File{ID: "test-file", Filename: "test.txt", ContentType: "text/plain"}
-	if err := s.CreateFile(context.Background(), "local-demo", &file, strings.NewReader("content")); err != nil {
+	if err := s.CreateFile(context.Background(), "alice@example.com", &file, strings.NewReader("content")); err != nil {
 		t.Fatal(err)
 	}
 	for _, path := range []string{"/api/contacts", "/api/contacts/export", "/api/files/test-file"} {
@@ -249,7 +252,7 @@ func TestFailedResponsesAbortInsteadOfCompletingPartialBodies(t *testing.T) {
 func TestInconsistentFileMetadataFailsBeforeDownload(t *testing.T) {
 	h, s, token := testAPI(t)
 	file := store.File{ID: "test-file", Filename: "test.txt", ContentType: "text/plain"}
-	if err := s.CreateFile(context.Background(), "local-demo", &file, strings.NewReader("content")); err != nil {
+	if err := s.CreateFile(context.Background(), "alice@example.com", &file, strings.NewReader("content")); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.DB().Exec(`UPDATE files SET size = size + 1 WHERE id = ?`, file.ID); err != nil {

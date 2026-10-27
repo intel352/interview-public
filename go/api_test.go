@@ -57,11 +57,11 @@ func runTests(m *testing.M) (code int) {
 		return 1
 	}
 	seed.SetQuiet(true)
-	if err := seed.Run(context.Background(), testStore, seed.Options{Contacts: 1000, Files: 5}); err != nil {
+	if err := seed.Run(context.Background(), testStore, seed.Options{Contacts: 1000, Files: 5, Actors: []string{"alice@example.com"}}); err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to seed: %v\n", err)
 		return 1
 	}
-	testServer = httptest.NewServer(app.NewRouter(testStore, app.Options{AuthToken: testToken}))
+	testServer = httptest.NewServer(app.NewRouter(testStore, app.Options{AuthTokens: map[string]string{testToken: "alice@example.com"}}))
 	defer testServer.Close()
 	return m.Run()
 }
@@ -109,7 +109,7 @@ func benchmarkClient(b *testing.B) *http.Client {
 
 func benchmarkContactID(b *testing.B) string {
 	b.Helper()
-	contacts, err := testStore.ListContacts(context.Background(), 1, nil)
+	contacts, err := testStore.ListContacts(context.Background(), "alice@example.com", 1, nil)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -121,7 +121,7 @@ func benchmarkContactID(b *testing.B) string {
 
 func benchmarkFileID(b *testing.B) string {
 	b.Helper()
-	files, err := testStore.ListFiles(context.Background())
+	files, err := testStore.ListFiles(context.Background(), "alice@example.com")
 	if err != nil {
 		b.Fatal(err)
 	}

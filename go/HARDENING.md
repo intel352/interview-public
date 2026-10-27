@@ -1,119 +1,136 @@
-# Go hardening
+# Go security and reliability design
 
-The request limiter remains a small, independent middleware. This document covers
-the additional security and reliability work, including changes to starter
-behavior. Java is unchanged; no identity provider or external service is required.
+The request limiter remains independent middleware. The broader Go changes cover
+actor ownership, HTTP/resource boundaries, storage consistency and lifecycle.
+Java is unchanged. See [compatibility review](COMPATIBILITY.md) for behavior
+changes from the starter and [API testing](API_TESTING.md) for scenario evidence.
 
-## Local-demo boundary and access policy
+## Local actors and ownership
 
-- The server binds only numeric loopback IP addresses (`127.0.0.0/8` or `::1`).
-  Wildcard, nonloopback, and hostname addresses are rejected before opening data.
-- After a successful bind, startup creates a 256-bit random bearer token and
-  prints it once to the local operator. The token stays in memory and changes
-  after restart. There is no fixed password, token file, or persistent credential.
-- Every client holding that token acts as `local-demo` with full access to one
-  shared workspace. Email-shaped bearer strings no longer authenticate. Empty
-  authentication configuration denies protected routes. Duplicate authorization
-  headers are rejected, and token comparison uses constant-time comparison.
-- `/health` remains public. The global leaky bucket still counts every client,
-  route, and authentication outcome. Its capacity, rate, and rejection policy are
-  unchanged. Access logging wraps it, including `429` responses.
-- Startup output and the operating-system account must be trusted. This boundary
-  does not protect against a compromised host, a local administrator, or direct
-  filesystem access. Do not expose the service through a proxy or tunnel and call
-  it production authentication. A multi-user service needs a real identity and
-  authorization design; adding one is not simulated here.
+The API and health servers bind only numeric loopback addresses. After both bind,
+startup generates one 256-bit random token per configured actor and prints each
+once to the local operator. Defaults are `alice@example.com,bob@example.com`;
+`--actors` accepts 1–64 case-sensitive labels, each at most 254 UTF-8 bytes without
+whitespace, commas or controls. They are local labels, not verified email claims.
+Tokens stay in memory and rotate on restart. Email-shaped strings do not grant
+access. Duplicate authorization headers and invalid/empty mappings fail closed;
+the immutable middleware snapshot compares credentials in constant time.
+
+An authenticated actor is carried into every contact/file ownership and audit
+operation. The schema has an actor registry, non-null ownership columns and
+foreign keys enabled on every SQLite connection. The server derives owners;
+client-supplied metadata is rejected. Lists, CRUD, imports, exports, file metadata,
+downloads and reports filter by the current actor. Foreign resource IDs yield the
+same not-found response as absent IDs. Actor-bound cursors cannot be directly
+reused by another actor; cursor tampering never removes the owner filter.
+
+Only identity labels persist. Reconfiguring the same actor after restart gives
+access with a fresh token; omitting it from configuration grants no credential.
+The local operator sees every startup credential and can access SQLite/files.
+This does not provide isolation from that operator or a compromised host. Do not
+expose the demo through a proxy/tunnel and call it production authentication.
+
+## HTTP listeners and limiting
+
+The business API defaults to `127.0.0.1:8080`; health defaults to the same IP and
+API port + 1. `--health-addr` overrides it. API port `0` requests independent
+OS-assigned ports for both listeners. Port `65535` requires an explicit override.
+IPv6 loopback works. Invalid/colliding binds fail before any credential output;
+a partial bind is closed.
+
+The health listener exposes only public `GET /health`, returning process liveness
+without database details. It has no business handlers and never uses the API
+limiter. The API listener has no health handler. One global leaky bucket on the
+API listener admits one request per six seconds across all actors and outcomes;
+rejected requests return non-cacheable JSON `429` and rounded-up `Retry-After`.
+It limits admission spacing, not concurrent in-flight handlers or fairness.
+
+Both servers set 5-second header, 30-second read/write/request and 60-second idle
+deadlines, with a 16 KiB header limit. The write budget includes body reading.
+These fixed local-demo limits can reject legitimate slow transfers. Both listeners
+stop together on cancellation or server failure. Active handlers get five seconds
+to finish; expiration cancels requests and forcibly closes connections. Server
+loops are joined before shared storage closes. Handlers/readers must cooperate
+with cancellation; no unbounded background-copy workaround is introduced.
 
 ## Input and response rules
 
-| Input | Go policy |
+| Input | Policy |
 |---|---|
-| Create/update contact | `application/json`, at most 1 MiB, one non-null object |
-| Contact import | `application/json`, at most 8 MiB, array decoded incrementally, at most 10,000 contacts |
-| Writable contact fields | `first_name`, `last_name`, `email`, `phone`, `company`; IDs/timestamps and unknown fields rejected |
-| Names/company | At most 256 Unicode code points per field |
+| Create/update contact | application/json, at most 1 MiB, one object |
+| Contact import | application/json, at most 8 MiB, streaming array, at most 10,000 objects |
+| Writable fields | Exactly `first_name`, `last_name`, `email`, `phone`, `company`; no duplicate/case-folded keys or null values |
+| Missing fields / PUT | Empty strings allowed; PUT replaces all writable fields, so omitted fields clear |
+| Names/company | At most 256 Unicode code points each |
 | Phone | At most 64 Unicode code points |
-| Email | Optional; when present, a plain parsed address of at most 254 bytes |
-| Contact controls | Control characters rejected; other fields may remain empty |
-| Upload | Exactly one `file` part, at most 100 MiB content; total multipart body at most 101 MiB |
-| Filename | Nonempty, at most 255 bytes, no path separators or control characters |
+| Email | Optional plain parsed address, at most 254 bytes |
+| Contact controls | Rejected |
+| Upload | Exactly one `file` part, at most 100 MiB content; multipart body at most 101 MiB |
+| Filename | Nonempty, at most 255 bytes; no path separators or controls |
 
-Malformed, unknown-field, trailing, or invalid-shape JSON returns `400`.
-Unsupported media types return `415`; byte limits return `413`. Import validation
-finishes before any database mutation. Pagination and date queries are bounded
-and invalid values are rejected rather than silently treated as defaults.
+Invalid JSON/shape/fields returns `400`, unsupported media `415`, excessive bytes
+`413`. Imports finish validation before mutation. Query limits/date formats are
+validated. Empty collections are arrays. Contact/file responses include read-only
+`owner_id`; a GET object must be projected to writable fields before PUT/import.
 
-CSV export prefixes potentially formula-interpreted cells with an apostrophe,
-including formula markers following whitespace/control prefixes. Stored values
-remain unchanged. This is an explicit spreadsheet-safe export policy, so exported
-text may differ from stored text. Consumers requiring exact values can use JSON.
+CSV prefixes potentially formula-interpreted cells with an apostrophe, including
+markers after whitespace/control prefixes. Stored values do not change. This
+also changes some phone/text representations; use JSON for exact values. CSV is
+not a lossless backup and live keyset pagination is not a snapshot.
 
-Downloads use a safely formatted attachment filename, validated content type,
-`nosniff`, and a sandbox content-security policy. Stored file size and regular-file
-status are checked before sending headers, and `Content-Length` is set. Failed
-JSON/CSV/file transmission aborts the response rather than appending a second
-status or presenting a partial chunked body as complete. Error logs omit request
-bodies and credentials. Responses are marked `Cache-Control: no-store`.
+Downloads validate regular-file status and size before headers and use a safely
+formatted attachment filename, validated media type, Content-Length, `nosniff`
+and sandbox policy. Responses are non-cacheable. Failed JSON/CSV/file writes
+abort instead of completing a partial body or appending another status. Logs omit
+bodies and credentials; startup token output must remain private.
 
-## Storage, concurrency, and audit
+## SQLite, timestamps, audit and seed
 
-SQLite has a single local connection, including idle connections. This serializes
-local database work and lets callers waiting for the connection honor context
-cancellation. WAL and a 5-second busy timeout are configured on each connection,
-including replacements. The timeout is bounded mitigation for other processes,
-not a guarantee that arbitrary external writers cannot cause contention.
+One SQLite connection serializes local database operations; waiting callers can
+cancel. WAL and a 5-second busy timeout apply to each replacement connection.
+Other processes can still cause bounded contention. Transaction callbacks use
+the transaction connection rather than reacquiring the single pool connection.
 
-Contact creation, update, deletion, import, and file metadata insertion commit
-their mutation and audit entry in the same transaction. An audit failure rolls
-back the mutation. Transaction callbacks use the transaction connection rather
-than reacquiring the single pool connection. Updates return the original creation
-timestamp. Activity reports have stable ordering.
+Each mutation and its audit entry commit together. Audit failure rolls back the
+mutation. Read delivery actions retain the original `export`, `download`, `view`
+labels and are recorded before output; they represent attempts, not guaranteed
+receipt. Validation/authorization/missing-resource failures add no successful
+operation audit. Reports compute a snapshot before recording their own `view`,
+which appears on a later request. Reports are actor-filtered with UTC cutoffs.
 
-Downloads, exports, and reports record `download_attempt`, `export_attempt`, and
-`report_attempt` before sending output. Audit failure prevents delivery. These
-events record attempts, not proof that a client received the entire response.
+Schema version 2 stores fixed-width UTC timestamps with nine fractional digits.
+SQLite defaults and Go bindings use the same format; schema checks reject mixed
+representations. This preserves nanoseconds, indexed chronological tuple ordering
+and exact inclusive report cutoffs. Live pagination survives deletion of its
+anchor, filters every page by actor and omits later inserts before that cursor.
 
-New data directories use `0700`; new database and upload files use `0600`.
-Existing permissions are preserved, so inspect them when reusing old data. Stored
-file IDs are restricted to safe characters and files are created exclusively:
-duplicate IDs cannot overwrite an existing blob. Copy, cancellation, size,
-sync, close, metadata, and audit failures are checked. Failed attempts remove
-only files created by that attempt, and cleanup failures are surfaced.
+Startup does not infer initialization from contact count. Seeding uses one SQLite
+transaction for actors, contacts, metadata, activity and an explicit completion
+marker. Existing application data does not masquerade as a completed seed; zero
+contacts are valid. Completed seeding is a no-op. Normal failure/cancellation
+rolls back all seed rows and removes only newly created files, making retry safe.
+Seeded activity includes 5,000 explicitly synthetic historical events, not proof
+that corresponding business requests occurred.
 
-Filesystem content and SQLite are not one crash-atomic transaction. Ordinary
-failures are cleaned up, but a crash or power loss can still require recovery of
-orphaned content or inconsistent metadata/directory entries. Backups and recovery
-tooling would be a separate production requirement. Cancellation is checked
-between file reads; an arbitrary reader already blocked inside `Read` must
-cooperate to be interrupted. No leaking background goroutine is used to work
-around that limitation.
+New directories use `0700`; database/blobs use `0600`. Existing permissions are
+preserved. File IDs are validated and files created exclusively. Copy, sync,
+close, size, cancellation, metadata and audit errors are checked; duplicate IDs
+cannot overwrite another blob. Cleanup removes only files owned by that attempt.
+SQLite and files cannot be one crash-atomic transaction: abrupt process/power
+loss can leave orphaned blobs requiring recovery. No power-loss durability claim
+is made.
 
-## Server and test lifecycle
-
-The server sets a 5-second header deadline, 30-second read/write deadlines,
-60-second idle timeout, 16 KiB header limit, and a 30-second request context.
-The write deadline includes request-body time; uploads do not get a second
-30-second response budget. These are deliberate local-demo limits, not tuned
-production upload settings.
-
-Shutdown first stops acceptance and allows five seconds for active handlers to
-finish. If that expires, request contexts are canceled, connections are forcibly
-closed, and the error is reported. Unexpected listener failures also close
-accepted connections. Startup, serving, shutdown, and store-close errors reach
-the process exit status. Cleanup runs before `os.Exit`.
-
-Tests and benchmarks use generated tokens and private temporary stores. Benchmark
-requests assert expected HTTP status and check request construction, body writes,
-drains, and closes. Their unwrapped router deliberately measures CRM handlers;
-separate tests and the launched-server smoke exercise the global limiter.
+Legacy/shared or unsupported intermediate schemas are rejected read-only before
+schema/WAL changes. Ownership cannot reliably be reconstructed from old audit
+history, so no automatic assignment or shared fallback is provided. Back up old
+data and use a fresh directory or a separately reviewed explicit offline migration.
 
 ## Verification
-
-From `go/`, using Go 1.27.3:
 
 ```bash
 go test -count=1 ./...
 go test -race -count=1 ./...
+make test-bdd
 go test -run '^$' -bench . -benchtime=1x -count=1 .
 go vet ./...
 go build -o bin/server ./cmd/server
@@ -122,12 +139,9 @@ golangci-lint run --no-config ./...
 govulncheck -test ./...
 ```
 
-Use golangci-lint 2.15.0 or a compatible official version built with Go 1.27 or
-newer. The repository has no custom lint exclusions or weakened rule set.
-The dependency scan used official govulncheck 1.9.0 built with Go 1.27.3;
-an older scanner built with Go 1.26 could not parse the current toolchain.
-Regressions cover authentication, body/field/import boundaries, audit rollback,
-duplicate-file preservation, cleanup/cancellation, concurrent storage and HTTP
-workflows, deadlines, graceful/forced shutdown, response failures, and the
-original limiter boundaries. Race checks cover executed paths; passing them is
-not a proof that every possible race or vulnerability is absent.
+Use Go 1.27.3 and a compatible official linter (validation uses golangci-lint
+2.15.0 built with Go 1.27.0). The official vulnerability scanner is govulncheck
+1.9.0 built with Go 1.27.3. No linter exclusions or weakened rule set were added.
+Tests and benchmarks check actual statuses/errors and clean up before os.Exit.
+Passing race tests or advisory scans does not establish absence of every possible
+race or vulnerability; explicit coverage and exclusions are in API_TESTING.md.

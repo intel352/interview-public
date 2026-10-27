@@ -24,6 +24,7 @@ type listContactsResponse struct {
 }
 
 func (a *API) HandleListContacts(w http.ResponseWriter, r *http.Request) {
+	actor := auth.UserID(r.Context())
 	limit := 50
 	if v := r.URL.Query().Get("limit"); v != "" {
 		n, err := strconv.Atoi(v)
@@ -43,7 +44,11 @@ func (a *API) HandleListContacts(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	contacts, err := a.store.ListContacts(r.Context(), limit+1, cursor)
+	contacts, err := a.store.ListContacts(r.Context(), actor, limit+1, cursor)
+	if errors.Is(err, store.ErrInvalidPageToken) {
+		writeError(w, http.StatusBadRequest, "invalid page token")
+		return
+	}
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to list contacts")
 		return
@@ -53,6 +58,7 @@ func (a *API) HandleListContacts(w http.ResponseWriter, r *http.Request) {
 	if len(contacts) > limit {
 		last := contacts[limit-1]
 		nextToken, err = encodePageToken(&store.PageToken{
+			OwnerID:   actor,
 			CreatedAt: last.CreatedAt,
 			ID:        last.ID,
 		})
@@ -89,7 +95,7 @@ func decodePageToken(s string) *store.PageToken {
 	if err := json.Unmarshal(data, &t); err != nil {
 		return nil
 	}
-	if t.CreatedAt.IsZero() || t.ID == "" || len(t.ID) > 128 {
+	if t.CreatedAt.IsZero() || t.ID == "" || len(t.ID) > 128 || t.OwnerID == "" {
 		return nil
 	}
 	return &t
@@ -98,7 +104,7 @@ func decodePageToken(s string) *store.PageToken {
 func (a *API) HandleGetContact(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 
-	contact, err := a.store.GetContact(r.Context(), id)
+	contact, err := a.store.GetContact(r.Context(), auth.UserID(r.Context()), id)
 	if errors.Is(err, store.ErrNotFound) {
 		writeError(w, http.StatusNotFound, "contact not found")
 		return
@@ -182,13 +188,13 @@ func (a *API) HandleImportContacts(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) HandleExportContacts(w http.ResponseWriter, r *http.Request) {
-	contacts, err := a.store.ExportContacts(r.Context())
+	contacts, err := a.store.ExportContacts(r.Context(), auth.UserID(r.Context()))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to export contacts")
 		return
 	}
 	// This records the attempt, not guaranteed delivery to a connected client.
-	if err := a.store.LogActivity(r.Context(), auth.UserID(r.Context()), "export_attempt", "contacts", ""); err != nil {
+	if err := a.store.LogActivity(r.Context(), auth.UserID(r.Context()), "export", "contacts", ""); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to record export attempt")
 		return
 	}

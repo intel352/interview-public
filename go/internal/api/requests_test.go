@@ -38,6 +38,52 @@ func TestDecodeContactRejectsInvalidRequests(t *testing.T) {
 	}
 }
 
+func TestDecodeContactRequiresExactUniqueStringFields(t *testing.T) {
+	for _, field := range []string{"first_name", "last_name", "email", "phone", "company"} {
+		for _, scenario := range []struct{ name, body string }{
+			{"null", fmt.Sprintf(`{%q:null}`, field)},
+			{"duplicate", fmt.Sprintf(`{%q:"",%q:""}`, field, field)},
+			{"case_mismatch", fmt.Sprintf(`{%q:""}`, strings.ToUpper(field))},
+		} {
+			t.Run(field+"_"+scenario.name, func(t *testing.T) {
+				for _, imported := range []bool{false, true} {
+					body := scenario.body
+					if imported {
+						body = "[" + body + "]"
+					}
+					r := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(body))
+					r.Header.Set("Content-Type", "application/json")
+					w := httptest.NewRecorder()
+					var accepted bool
+					if imported {
+						_, accepted = decodeContactImport(w, r)
+					} else {
+						_, accepted = decodeContact(w, r)
+					}
+					if accepted || w.Code != http.StatusBadRequest {
+						t.Errorf("import=%v accepted=%v status=%d; want rejected400", imported, accepted, w.Code)
+					}
+				}
+			})
+		}
+	}
+	for _, body := range []string{
+		`{"first_name":"one","first\u005fname":"two"}`,
+		`{"first_name":false}`,
+		`{"first_name":42}`,
+		`{"first_name":[]}`,
+		`{"first_name":{}}`,
+		`{"owner_id":"other@example.com"}`,
+	} {
+		r := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(body))
+		r.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		if _, accepted := decodeContact(w, r); accepted || w.Code != http.StatusBadRequest {
+			t.Errorf("body=%s accepted=%v status=%d; want rejected400", body, accepted, w.Code)
+		}
+	}
+}
+
 func TestDecodeContactExactBodyAndFieldLimits(t *testing.T) {
 	body := fmt.Sprintf(`{"first_name":%q,"last_name":%q,"phone":%q,"company":%q}`, strings.Repeat("界", 256), strings.Repeat("x", 256), strings.Repeat("1", 64), strings.Repeat("y", 256))
 	for _, extra := range []int{0, 1} {

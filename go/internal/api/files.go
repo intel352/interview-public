@@ -94,7 +94,7 @@ func (a *API) HandleUploadFile(w http.ResponseWriter, r *http.Request) {
 func (a *API) HandleDownloadFile(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 
-	file, meta, err := a.store.OpenFile(r.Context(), id)
+	file, meta, err := a.store.OpenFile(r.Context(), auth.UserID(r.Context()), id)
 	if errors.Is(err, store.ErrInvalidFileID) {
 		writeError(w, http.StatusBadRequest, "invalid file ID")
 		return
@@ -117,7 +117,9 @@ func (a *API) HandleDownloadFile(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "stored file is unavailable or inconsistent")
 		return
 	}
-	if err := a.store.LogActivity(r.Context(), auth.UserID(r.Context()), "download_attempt", "file", id); err != nil {
+	// Preserve the historical action name; this records an attempt before output,
+	// not proof that the client received the complete file.
+	if err := a.store.LogActivity(r.Context(), auth.UserID(r.Context()), "download", "file", id); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to record download attempt")
 		return
 	}
@@ -139,7 +141,7 @@ func (a *API) HandleDownloadFile(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) HandleListFiles(w http.ResponseWriter, r *http.Request) {
-	files, err := a.store.ListFiles(r.Context())
+	files, err := a.store.ListFiles(r.Context(), auth.UserID(r.Context()))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to list files")
 		return

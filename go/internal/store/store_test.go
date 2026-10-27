@@ -25,6 +25,9 @@ func testStore(t *testing.T) *Store {
 			t.Error(err)
 		}
 	})
+	if err := s.RegisterActors(t.Context(), []string{"local-demo", "seed"}); err != nil {
+		t.Fatal(err)
+	}
 	return s
 }
 
@@ -42,7 +45,7 @@ func TestContactAuditFailureRollsBack(t *testing.T) {
 	if err := s.CreateContact(context.Background(), "local-demo", c); err == nil {
 		t.Fatal("create succeeded despite audit failure")
 	}
-	count, err := s.CountContacts(context.Background())
+	count, err := s.CountContacts(context.Background(), "local-demo")
 	if err != nil || count != 0 {
 		t.Fatalf("count=%d, err=%v; want empty store", count, err)
 	}
@@ -57,7 +60,7 @@ func TestDuplicateFilePreservesOriginal(t *testing.T) {
 	if err := s.CreateFile(ctx, "local-demo", &File{ID: "file-1"}, strings.NewReader("replacement")); err == nil {
 		t.Fatal("duplicate file accepted")
 	}
-	f, _, err := s.OpenFile(ctx, "file-1")
+	f, _, err := s.OpenFile(ctx, "local-demo", "file-1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -73,7 +76,7 @@ func TestContactMutationsRollbackOnAuditFailure(t *testing.T) {
 		t.Run(operation, func(t *testing.T) {
 			s := testStore(t)
 			ctx := t.Context()
-			if err := s.CreateContact(ctx, "seed", &Contact{ID: "original", FirstName: "Before"}); err != nil {
+			if err := s.CreateContact(ctx, "local-demo", &Contact{ID: "original", FirstName: "Before"}); err != nil {
 				t.Fatal(err)
 			}
 			rejectAuditWrites(t, s)
@@ -95,7 +98,7 @@ func TestContactMutationsRollbackOnAuditFailure(t *testing.T) {
 			if err == nil {
 				t.Fatal("mutation succeeded despite audit failure")
 			}
-			contacts, err := s.ExportContacts(ctx)
+			contacts, err := s.ExportContacts(ctx, "local-demo")
 			if err != nil || len(contacts) != 1 || contacts[0].ID != "original" || contacts[0].FirstName != "Before" {
 				t.Fatalf("contacts=%+v err=%v; original must be unchanged", contacts, err)
 			}
@@ -135,7 +138,7 @@ func TestConcurrentWritersAllPersistWithAudit(t *testing.T) {
 			t.Errorf("concurrent write: %v", err)
 		}
 	}
-	count, err := s.CountContacts(t.Context())
+	count, err := s.CountContacts(t.Context(), "local-demo")
 	if err != nil || count != writers || activityCount(t, s) != writers {
 		t.Fatalf("contacts=%d, err=%v; want %d contacts and audits", count, err, writers)
 	}
@@ -240,7 +243,7 @@ func assertNoFiles(t *testing.T, s *Store) {
 	if err != nil || len(entries) != 0 {
 		t.Fatalf("remaining content files=%v err=%v", entries, err)
 	}
-	files, err := s.ListFiles(t.Context())
+	files, err := s.ListFiles(t.Context(), "local-demo")
 	if err != nil || len(files) != 0 || activityCount(t, s) != 0 {
 		t.Fatalf("remaining metadata=%v err=%v; want no files or audits", files, err)
 	}
@@ -252,7 +255,7 @@ func TestInvalidFileIDs(t *testing.T) {
 		if err := s.CreateFile(t.Context(), "local-demo", &File{ID: id}, strings.NewReader("content")); !errors.Is(err, ErrInvalidFileID) {
 			t.Errorf("create ID %q: got %v", id, err)
 		}
-		if _, err := s.GetFile(t.Context(), id); !errors.Is(err, ErrInvalidFileID) {
+		if _, err := s.GetFile(t.Context(), "local-demo", id); !errors.Is(err, ErrInvalidFileID) {
 			t.Errorf("get ID %q: got %v", id, err)
 		}
 	}
@@ -300,6 +303,9 @@ func TestStorePermissionsAndSQLiteSettings(t *testing.T) {
 			t.Error(err)
 		}
 	})
+	if err := s.RegisterActors(t.Context(), []string{"local-demo"}); err != nil {
+		t.Fatal(err)
+	}
 	if err := s.CreateFile(t.Context(), "local-demo", &File{ID: "upload"}, strings.NewReader("content")); err != nil {
 		t.Fatal(err)
 	}
@@ -327,7 +333,7 @@ func TestStorePermissionsAndSQLiteSettings(t *testing.T) {
 func TestUpdateContactPreservesCreatedAt(t *testing.T) {
 	s := testStore(t)
 	original := &Contact{ID: "original", FirstName: "Before"}
-	if err := s.CreateContact(t.Context(), "seed", original); err != nil {
+	if err := s.CreateContact(t.Context(), "local-demo", original); err != nil {
 		t.Fatal(err)
 	}
 	updated := &Contact{ID: original.ID, FirstName: "After"}
@@ -337,7 +343,7 @@ func TestUpdateContactPreservesCreatedAt(t *testing.T) {
 	if updated.CreatedAt.IsZero() || !updated.CreatedAt.Equal(original.CreatedAt) {
 		t.Fatalf("update returned created_at=%s, want %s", updated.CreatedAt, original.CreatedAt)
 	}
-	stored, err := s.GetContact(t.Context(), original.ID)
+	stored, err := s.GetContact(t.Context(), "local-demo", original.ID)
 	if err != nil || !stored.CreatedAt.Equal(updated.CreatedAt) || !stored.UpdatedAt.Equal(updated.UpdatedAt) {
 		t.Fatalf("stored timestamps differ from update response: stored=%+v updated=%+v err=%v", stored, updated, err)
 	}
@@ -351,7 +357,7 @@ func TestUpdateContactFailureLeavesTimestampsAndAuditUnchanged(t *testing.T) {
 		t.Run(operation, func(t *testing.T) {
 			s := testStore(t)
 			original := &Contact{ID: "original", FirstName: "Before"}
-			if err := s.CreateContact(t.Context(), "seed", original); err != nil {
+			if err := s.CreateContact(t.Context(), "local-demo", original); err != nil {
 				t.Fatal(err)
 			}
 			updated := &Contact{ID: "missing", FirstName: "After"}
@@ -366,7 +372,7 @@ func TestUpdateContactFailureLeavesTimestampsAndAuditUnchanged(t *testing.T) {
 			if !updated.CreatedAt.IsZero() || !updated.UpdatedAt.IsZero() {
 				t.Fatalf("failed update changed caller timestamps: %+v", updated)
 			}
-			stored, err := s.GetContact(t.Context(), original.ID)
+			stored, err := s.GetContact(t.Context(), "local-demo", original.ID)
 			if err != nil || stored.FirstName != original.FirstName || !stored.CreatedAt.Equal(original.CreatedAt) || !stored.UpdatedAt.Equal(original.UpdatedAt) {
 				t.Fatalf("failed update changed original: %+v err=%v", stored, err)
 			}

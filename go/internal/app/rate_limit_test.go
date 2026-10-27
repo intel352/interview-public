@@ -213,8 +213,11 @@ func TestRateLimitRouterWrites(t *testing.T) {
 			t.Errorf("close store: %v", err)
 		}
 	})
+	if err := s.RegisterActors(t.Context(), []string{"alice@example.com"}); err != nil {
+		t.Fatal(err)
+	}
 	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-	h := rateLimit(NewRouter(s, Options{AuthToken: token}), func() time.Time { return now })
+	h := rateLimit(NewRouter(s, Options{AuthTokens: map[string]string{token: "alice@example.com"}}), func() time.Time { return now })
 	for i, want := range []int{http.StatusCreated, http.StatusTooManyRequests} {
 		r := httptest.NewRequest(http.MethodPost, "/api/contacts", strings.NewReader(`{"first_name":"Test","email":"test@example.com"}`))
 		r.Header.Set("Authorization", "Bearer "+token)
@@ -226,7 +229,7 @@ func TestRateLimitRouterWrites(t *testing.T) {
 			t.Fatalf("write %d: got status %d, want %d: %s", i, w.Code, want, w.Body.String())
 		}
 	}
-	count, err := s.CountContacts(context.Background())
+	count, err := s.CountContacts(context.Background(), "alice@example.com")
 	if err != nil || count != 1 {
 		t.Fatalf("stored contacts=%d, err=%v; want 1", count, err)
 	}
@@ -241,10 +244,10 @@ func TestRateLimitRouterWrites(t *testing.T) {
 	}
 }
 
-func TestRateLimitIncludesHealthAuthAndUnknownRoutes(t *testing.T) {
+func TestRateLimitIncludesAuthAndUnknownAPIRoutes(t *testing.T) {
 	const token = "test-only-rate-limit-token"
 	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-	h := rateLimit(NewRouter(nil, Options{AuthToken: token}), func() time.Time { return now })
+	h := rateLimit(NewRouter(nil, Options{AuthTokens: map[string]string{token: "alice@example.com"}}), func() time.Time { return now })
 	for _, tt := range []struct {
 		advance time.Duration
 		method  string
@@ -252,7 +255,7 @@ func TestRateLimitIncludesHealthAuthAndUnknownRoutes(t *testing.T) {
 		token   string
 		code    int
 	}{
-		{0, "GET", "/health", "", 200},
+		{0, "GET", "/health", "", 404},
 		{0, "GET", "/api/contacts", "", 429},
 		{6 * time.Second, "GET", "/api/contacts", "", 401},
 		{0, "GET", "/health", "", 429},

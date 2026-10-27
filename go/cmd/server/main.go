@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -43,6 +44,8 @@ func run(ctx context.Context, args []string, output io.Writer) (result error) {
 	flags := flag.NewFlagSet("server", flag.ContinueOnError)
 	flags.SetOutput(output)
 	addr := flags.String("addr", "127.0.0.1:8080", "numeric loopback listen address")
+	healthAddr := flags.String("health-addr", "", "health loopback address (default API port + 1; API port 0 uses a separate ephemeral port)")
+	actorList := flags.String("actors", auth.DefaultActors, "comma-separated local actor identifiers")
 	dataDir := flags.String("data", "data", "data directory")
 	doSeed := flags.Bool("seed", false, "seed database with test data")
 	contacts := flags.Int("contacts", 10000, "number of contacts to seed")
@@ -53,9 +56,13 @@ func run(ctx context.Context, args []string, output io.Writer) (result error) {
 	if flags.NArg() != 0 || *contacts < 0 || *files < 0 {
 		return errors.New("unexpected arguments or negative seed counts")
 	}
-	address, err := loopbackAddress(*addr)
+	address, healthAddress, err := listenerAddresses(*addr, *healthAddr)
 	if err != nil {
 		return err
+	}
+	actors, err := auth.ParseActors(*actorList)
+	if err != nil {
+		return fmt.Errorf("actors: %w", err)
 	}
 	if err := ctx.Err(); err != nil {
 		return err
@@ -66,45 +73,55 @@ func run(ctx context.Context, args []string, output io.Writer) (result error) {
 	}
 	defer func() { result = errors.Join(result, s.Close()) }()
 
-	count, err := s.CountContacts(ctx)
-	if err != nil {
-		return fmt.Errorf("check database: %w", err)
-	}
 	if *doSeed {
-		if count > 0 {
-			_, err := fmt.Fprintln(output, "Database already seeded. Use 'make reset' to reset.")
-			return err
-		}
-		if err := seed.Run(ctx, s, seed.Options{Contacts: *contacts, Files: *files}); err != nil {
+		if err := seed.Run(ctx, s, seed.Options{Contacts: *contacts, Files: *files, Actors: actors}); err != nil {
 			return fmt.Errorf("seed database: %w", err)
 		}
 		_, err := fmt.Fprintln(output, "Done seeding.")
 		return err
 	}
-	if count == 0 {
-		return errors.New("database is empty; run with --seed first")
+	// Seeding registers actors inside its own atomic transaction. Ordinary
+	// startup registers only the identities configured for this server run.
+	if err := s.RegisterActors(ctx, actors); err != nil {
+		return fmt.Errorf("register local actors: %w", err)
 	}
 
-	listener, err := net.Listen("tcp", address)
-	if err != nil {
-		return fmt.Errorf("listen: %w", err)
-	}
-	defer func() {
-		if err := listener.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
-			result = errors.Join(result, err)
-		}
-	}()
-	token, err := auth.NewToken()
+	listener, healthListener, err := listenPair(address, healthAddress)
 	if err != nil {
 		return err
 	}
-	// This startup-only credential is shown to the local operator after binding.
-	// Never include it in access logs or persist it in the data directory.
-	if _, err := fmt.Fprintf(output, "Local demo listening on http://%s\nLocal demo bearer token (expires on restart): %s\n", listener.Addr(), token); err != nil {
+	defer func() {
+		for _, bound := range []net.Listener{listener, healthListener} {
+			if err := bound.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+				result = errors.Join(result, err)
+			}
+		}
+	}()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	credentials, err := auth.NewCredentials(actors)
+	if err != nil {
+		return err
+	}
+	// Startup-only credentials are shown in configured actor order after both
+	// binds. Never include them in access logs or persist them in the data dir.
+	byActor := make(map[string]string, len(credentials))
+	for token, actor := range credentials {
+		byActor[actor] = token
+	}
+	lines := []string{
+		fmt.Sprintf("Local demo API listening on http://%s", listener.Addr()),
+		fmt.Sprintf("Local demo health listening on http://%s", healthListener.Addr()),
+	}
+	for _, actor := range actors {
+		lines = append(lines, fmt.Sprintf("Local demo bearer token for %s (expires on restart): %s", actor, byActor[actor]))
+	}
+	if _, err := fmt.Fprintln(output, strings.Join(lines, "\n")); err != nil {
 		return fmt.Errorf("write startup information: %w", err)
 	}
-	handler := middleware.Logger(app.RateLimit(app.NewRouter(s, app.Options{AuthToken: token})))
-	return serve(ctx, listener, handler, 5*time.Second)
+	handler := middleware.Logger(app.RateLimit(app.NewRouter(s, app.Options{AuthTokens: credentials})))
+	return serveBoth(ctx, listener, healthListener, handler, app.NewHealthRouter(), 5*time.Second)
 }
 
 func loopbackAddress(address string) (string, error) {
@@ -158,4 +175,78 @@ func serve(ctx context.Context, listener net.Listener, handler http.Handler, gra
 		}
 		return errors.Join(shutdownErr, serveErr)
 	}
+}
+
+func listenerAddresses(apiAddress, healthAddress string) (string, string, error) {
+	api, err := loopbackAddress(apiAddress)
+	if err != nil {
+		return "", "", fmt.Errorf("API address: %w", err)
+	}
+	if healthAddress == "" {
+		host, portText, err := net.SplitHostPort(api)
+		if err != nil {
+			return "", "", err
+		}
+		port, err := strconv.Atoi(portText)
+		if err != nil {
+			return "", "", err
+		}
+		if port == 65535 {
+			return "", "", errors.New("API port 65535 has no next port; set --health-addr explicitly")
+		}
+		// Port zero requests independent OS allocation for both listeners. Using
+		// port one or a guessed neighbor of an ephemeral port would be unsafe.
+		if port != 0 {
+			port++
+		}
+		healthAddress = net.JoinHostPort(host, strconv.Itoa(port))
+	}
+	health, err := loopbackAddress(healthAddress)
+	if err != nil {
+		return "", "", fmt.Errorf("health address: %w", err)
+	}
+	if api == health && !strings.HasSuffix(api, ":0") {
+		return "", "", errors.New("API and health must use separate listen addresses")
+	}
+	return api, health, nil
+}
+
+func listenPair(apiAddress, healthAddress string) (net.Listener, net.Listener, error) {
+	api, err := net.Listen("tcp", apiAddress)
+	if err != nil {
+		return nil, nil, fmt.Errorf("listen API: %w", err)
+	}
+	health, err := net.Listen("tcp", healthAddress)
+	if err != nil {
+		return nil, nil, errors.Join(fmt.Errorf("listen health: %w", err), api.Close())
+	}
+	return api, health, nil
+}
+
+func serveBoth(ctx context.Context, apiListener, healthListener net.Listener, apiHandler, healthHandler http.Handler, grace time.Duration) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	results := make(chan error, 2)
+	for _, endpoint := range []struct {
+		name     string
+		listener net.Listener
+		handler  http.Handler
+	}{
+		{"API", apiListener, apiHandler},
+		{"health", healthListener, healthHandler},
+	} {
+		go func() {
+			err := serve(ctx, endpoint.listener, endpoint.handler, grace)
+			if err != nil {
+				err = fmt.Errorf("%s server: %w", endpoint.name, err)
+			}
+			results <- err
+		}()
+	}
+	first := <-results
+	// Any server exit stops the peer. Join both bounded server loops before
+	// releasing shared resources; active handlers must honor cancellation.
+	cancel()
+	second := <-results
+	return errors.Join(first, second)
 }

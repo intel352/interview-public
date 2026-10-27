@@ -22,11 +22,11 @@ const (
 // Separate writable fields from stored fields so clients cannot supply IDs or
 // timestamps. Empty fields remain valid for compatibility with the demo CRM.
 type contactInput struct {
-	FirstName string `json:"first_name"`
-	LastName  string `json:"last_name"`
-	Email     string `json:"email"`
-	Phone     string `json:"phone"`
-	Company   string `json:"company"`
+	FirstName string
+	LastName  string
+	Email     string
+	Phone     string
+	Company   string
 }
 
 func jsonDecoder(w http.ResponseWriter, r *http.Request, limit int64) (*json.Decoder, bool) {
@@ -40,9 +40,59 @@ func jsonDecoder(w http.ResponseWriter, r *http.Request, limit int64) (*json.Dec
 		return nil, false
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, limit)
-	decoder := json.NewDecoder(r.Body)
-	decoder.DisallowUnknownFields()
-	return decoder, true
+	return json.NewDecoder(r.Body), true
+}
+
+// Decode object members individually: normal struct decoding accepts duplicate
+// keys, case-insensitive names and null strings, which obscure client mistakes.
+func readContactInput(decoder *json.Decoder) (contactInput, error) {
+	var input contactInput
+	opening, err := decoder.Token()
+	if err != nil {
+		return input, err
+	}
+	if opening != json.Delim('{') {
+		return input, errors.New("expected a contact object")
+	}
+	remaining := map[string]*string{
+		"first_name": &input.FirstName,
+		"last_name":  &input.LastName,
+		"email":      &input.Email,
+		"phone":      &input.Phone,
+		"company":    &input.Company,
+	}
+	for decoder.More() {
+		keyToken, err := decoder.Token()
+		if err != nil {
+			return input, err
+		}
+		key, ok := keyToken.(string)
+		if !ok {
+			return input, errors.New("expected a contact field name")
+		}
+		field, ok := remaining[key]
+		if !ok {
+			return input, errors.New("unknown or duplicate contact field")
+		}
+		valueToken, err := decoder.Token()
+		if err != nil {
+			return input, err
+		}
+		value, ok := valueToken.(string)
+		if !ok {
+			return input, errors.New("contact fields must be non-null strings")
+		}
+		*field = value
+		delete(remaining, key)
+	}
+	closing, err := decoder.Token()
+	if err != nil {
+		return input, err
+	}
+	if closing != json.Delim('}') {
+		return input, errors.New("expected end of contact object")
+	}
+	return input, nil
 }
 
 func decodeError(w http.ResponseWriter, err error) {
@@ -67,12 +117,12 @@ func decodeContact(w http.ResponseWriter, r *http.Request) (store.Contact, bool)
 	if !ok {
 		return store.Contact{}, false
 	}
-	var input *contactInput
-	if err := decoder.Decode(&input); err != nil {
+	input, err := readContactInput(decoder)
+	if err != nil {
 		decodeError(w, err)
 		return store.Contact{}, false
 	}
-	if input == nil || !validContact(*input) {
+	if !validContact(input) {
 		writeError(w, http.StatusBadRequest, "invalid contact fields")
 		return store.Contact{}, false
 	}
@@ -102,12 +152,12 @@ func decodeContactImport(w http.ResponseWriter, r *http.Request) ([]store.Contac
 			writeError(w, http.StatusBadRequest, "maximum 10000 contacts per import")
 			return nil, false
 		}
-		var input *contactInput
-		if err := decoder.Decode(&input); err != nil {
+		input, err := readContactInput(decoder)
+		if err != nil {
 			decodeError(w, err)
 			return nil, false
 		}
-		if input == nil || !validContact(*input) {
+		if !validContact(input) {
 			writeError(w, http.StatusBadRequest, "invalid contact fields")
 			return nil, false
 		}

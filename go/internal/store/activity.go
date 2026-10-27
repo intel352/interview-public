@@ -34,7 +34,7 @@ func logActivity(ctx context.Context, db executor, userID, action, resourceType,
 	_, err := db.ExecContext(ctx, `
 		INSERT INTO activity_log (user_id, action, resource_type, resource_id, created_at)
 		VALUES (?, ?, ?, ?, ?)
-	`, userID, action, resourceType, resourceID, time.Now().UTC())
+	`, userID, action, resourceType, resourceID, DatabaseTime(time.Now()))
 	if err != nil {
 		return fmt.Errorf("insert activity: %w", err)
 	}
@@ -48,14 +48,14 @@ type ActivityReport struct {
 	ByResource   map[string]int `json:"by_resource"`
 }
 
-func (s *Store) GenerateActivityReport(ctx context.Context, since time.Time) (reports []ActivityReport, err error) {
+func (s *Store) GenerateActivityReport(ctx context.Context, actor string, since time.Time) (reports []ActivityReport, err error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT user_id, action, resource_type, COUNT(*) as cnt
 		FROM activity_log
-		WHERE created_at >= ?
+		WHERE user_id = ? AND created_at >= ?
 		GROUP BY user_id, action, resource_type
 		ORDER BY user_id
-	`, since)
+	`, actor, DatabaseTime(since))
 	if err != nil {
 		return nil, fmt.Errorf("query activity: %w", err)
 	}

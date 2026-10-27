@@ -23,6 +23,7 @@ var (
 
 type File struct {
 	ID          string    `json:"id"`
+	OwnerID     string    `json:"owner_id"`
 	Filename    string    `json:"filename"`
 	Size        int64     `json:"size"`
 	ContentType string    `json:"content_type"`
@@ -74,16 +75,20 @@ func (s *Store) CreateFile(ctx context.Context, actor string, f *File, content i
 	}
 	f.Size = n
 
-	return s.withTx(ctx, func(tx *sql.Tx) error {
+	err = s.withTx(ctx, func(tx *sql.Tx) error {
 		_, err := tx.ExecContext(ctx, `
-		INSERT INTO files (id, filename, size, content_type, created_at)
-		VALUES (?, ?, ?, ?, ?)
-	`, f.ID, f.Filename, f.Size, f.ContentType, f.CreatedAt)
+		INSERT INTO files (id, owner_id, filename, size, content_type, created_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`, f.ID, actor, f.Filename, f.Size, f.ContentType, DatabaseTime(f.CreatedAt))
 		if err != nil {
 			return fmt.Errorf("insert file record: %w", err)
 		}
 		return logActivity(ctx, tx, actor, "upload", "file", f.ID)
 	})
+	if err == nil {
+		f.OwnerID = actor
+	}
+	return err
 }
 
 // Cancellation is checked between reads; an arbitrary reader's already-blocked
@@ -100,15 +105,15 @@ func (r contextReader) Read(p []byte) (int, error) {
 	return r.reader.Read(p)
 }
 
-func (s *Store) GetFile(ctx context.Context, id string) (File, error) {
+func (s *Store) GetFile(ctx context.Context, actor, id string) (File, error) {
 	if !fileIDPattern.MatchString(id) {
 		return File{}, ErrInvalidFileID
 	}
 	var f File
 	err := s.db.QueryRowContext(ctx, `
-		SELECT id, filename, size, content_type, created_at
-		FROM files WHERE id = ?
-	`, id).Scan(&f.ID, &f.Filename, &f.Size, &f.ContentType, &f.CreatedAt)
+		SELECT id, owner_id, filename, size, content_type, created_at
+		FROM files WHERE owner_id = ? AND id = ?
+	`, actor, id).Scan(&f.ID, &f.OwnerID, &f.Filename, &f.Size, &f.ContentType, &f.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return File{}, ErrNotFound
 	}
@@ -118,8 +123,8 @@ func (s *Store) GetFile(ctx context.Context, id string) (File, error) {
 	return f, nil
 }
 
-func (s *Store) OpenFile(ctx context.Context, id string) (*os.File, File, error) {
-	f, err := s.GetFile(ctx, id)
+func (s *Store) OpenFile(ctx context.Context, actor, id string) (*os.File, File, error) {
+	f, err := s.GetFile(ctx, actor, id)
 	if err != nil {
 		return nil, File{}, err
 	}
@@ -132,12 +137,14 @@ func (s *Store) OpenFile(ctx context.Context, id string) (*os.File, File, error)
 	return file, f, nil
 }
 
-func (s *Store) ListFiles(ctx context.Context) (files []File, err error) {
+func (s *Store) ListFiles(ctx context.Context, actor string) (files []File, err error) {
+	files = make([]File, 0)
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, filename, size, content_type, created_at
+		SELECT id, owner_id, filename, size, content_type, created_at
 		FROM files
-		ORDER BY created_at DESC
-	`)
+		WHERE owner_id = ?
+		ORDER BY created_at DESC, id DESC
+	`, actor)
 	if err != nil {
 		return nil, fmt.Errorf("query files: %w", err)
 	}
@@ -145,7 +152,7 @@ func (s *Store) ListFiles(ctx context.Context) (files []File, err error) {
 
 	for rows.Next() {
 		var f File
-		if err := rows.Scan(&f.ID, &f.Filename, &f.Size, &f.ContentType, &f.CreatedAt); err != nil {
+		if err := rows.Scan(&f.ID, &f.OwnerID, &f.Filename, &f.Size, &f.ContentType, &f.CreatedAt); err != nil {
 			return nil, fmt.Errorf("scan file: %w", err)
 		}
 		files = append(files, f)

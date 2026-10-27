@@ -36,12 +36,15 @@ func newIntegrationServer(t *testing.T) (*store.Store, integrationClient) {
 			t.Errorf("close store: %v", err)
 		}
 	})
+	if err := s.RegisterActors(t.Context(), []string{"alice@example.com"}); err != nil {
+		t.Fatal(err)
+	}
 	token, err := auth.NewToken()
 	if err != nil {
 		t.Fatal(err)
 	}
 	// Leave out RateLimit: these tests must exercise overlapping handlers.
-	server := httptest.NewServer(NewRouter(s, Options{AuthToken: token}))
+	server := httptest.NewServer(NewRouter(s, Options{AuthTokens: map[string]string{token: "alice@example.com"}}))
 	t.Cleanup(server.Close)
 	client := server.Client()
 	client.Timeout = 10 * time.Second
@@ -101,17 +104,17 @@ func TestConcurrentHTTPMutationsAndAudits(t *testing.T) {
 	if t.Failed() {
 		return
 	}
-	count, err := s.CountContacts(ctx)
+	count, err := s.CountContacts(ctx, "alice@example.com")
 	if err != nil || count != 2*clients {
 		t.Fatalf("contacts=%d, error=%v; want %d", count, err, 2*clients)
 	}
-	files, err := s.ListFiles(ctx)
+	files, err := s.ListFiles(ctx, "alice@example.com")
 	if err != nil || len(files) != clients {
 		t.Fatalf("files=%d, error=%v; want %d", len(files), err, clients)
 	}
-	for _, action := range []string{"create", "update", "import", "upload", "download_attempt", "delete"} {
+	for _, action := range []string{"create", "update", "import", "upload", "download", "delete"} {
 		var count int
-		if err := s.DB().QueryRowContext(ctx, "SELECT COUNT(*) FROM activity_log WHERE action = ? AND user_id = ?", action, "local-demo").Scan(&count); err != nil {
+		if err := s.DB().QueryRowContext(ctx, "SELECT COUNT(*) FROM activity_log WHERE action = ? AND user_id = ?", action, "alice@example.com").Scan(&count); err != nil {
 			t.Fatal(err)
 		}
 		if count != clients {
@@ -233,7 +236,7 @@ func TestCanceledMutationDoesNotPersist(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 	contact := store.Contact{ID: "canceled-contact", FirstName: "Canceled"}
-	if err := s.CreateContact(ctx, "local-demo", &contact); !errors.Is(err, context.Canceled) {
+	if err := s.CreateContact(ctx, "alice@example.com", &contact); !errors.Is(err, context.Canceled) {
 		t.Fatalf("canceled create error=%v, want context.Canceled", err)
 	}
 	assertEmptyContactsAndAudits(t, s)
@@ -247,7 +250,7 @@ func TestHTTPAuditFailureRollsBackContact(t *testing.T) {
 	if _, err := client.request(t.Context(), http.MethodPost, "/api/contacts", "application/json", strings.NewReader(`{"first_name":"Rollback"}`), http.StatusInternalServerError); err != nil {
 		t.Fatal(err)
 	}
-	count, err := s.CountContacts(t.Context())
+	count, err := s.CountAllContacts(t.Context())
 	if err != nil || count != 0 {
 		t.Fatalf("contacts after failed audit=%d, error=%v; want 0", count, err)
 	}
@@ -255,7 +258,7 @@ func TestHTTPAuditFailureRollsBackContact(t *testing.T) {
 
 func assertEmptyContactsAndAudits(t *testing.T, s *store.Store) {
 	t.Helper()
-	count, err := s.CountContacts(t.Context())
+	count, err := s.CountAllContacts(t.Context())
 	if err != nil || count != 0 {
 		t.Fatalf("contacts=%d, error=%v; want 0", count, err)
 	}
