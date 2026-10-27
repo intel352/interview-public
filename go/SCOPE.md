@@ -1,138 +1,85 @@
-# Assignment scope and rationale
+# Change rationale and scope
 
-This PR contains the original limiter assignment **and a substantially larger
-set of later requested changes**. The larger set is not necessary to implement
-a leaky bucket and should not be presented as a 30–45-minute solution.
+- **Baseline:** starter `d35ce33`; final behavior reviewed through `12b4e29`.
+- **A — assignment:** run locally; readable, maintainable, process-global leaky bucket at 10 requests/minute.
+- **S — direct support:** wiring, failure handling and focused verification needed for a reliable limiter submission.
+- **E — expansion:** later requests for modernization, strict full-app fixes, actors/isolation, separate health, BDD/API testing and regression review. Specific policies below are our choices unless explicitly identified as requested.
+- **Reading guide:** each entry states the change, why it belongs, and the choice or cost. No claim that starter defects were intentional interview traps.
 
-The reference points are the prework brief supplied for this task and the starter
-at [`d35ce33`](https://github.com/weave-lab/interview-public/tree/d35ce33bfd64dcac5c929138dc7c83cf8cdb3bed).
-The starter README describes the CRM, toy email-bearer authentication and shared
-data; it does not require replacing that model. Findings below describe observed
-behavior, not presumed intentional interviewer traps. Go is the chosen
-implementation; Java remains unchanged.
+## Original limiter and direct support
 
-## 1. Original requested assignment
+- **A · Global budget:** one limiter instance around the business router; meets the shared 10/minute requirement without per-client or external state.
+- **A, choice · Capacity-one policing:** first admission immediate, then six-second spacing; simplest conservative burst policy. Lazy elapsed-time draining needs no ticker, queue or worker; idle time earns no burst credit.
+- **A, choice · Overflow and scope:** immediate JSON `429`, ceiling `Retry-After`, no-store; rejected attempts add no work. Charging before auth/routing keeps one rule for all business outcomes, but unauthenticated clients can consume the shared allowance.
+- **S · Synchronization:** mutex protects clock/drain/admit, never downstream handlers; prevents double admission without serializing handlers. Backward clocks cannot add credit; production uses `time.Now`.
+- **S · Wiring and logging:** wrap production once, keep `NewRouter` independently reusable, move logging outside the limiter; enforces the budget and logs rejections without throttling handler benchmarks.
+- **S · Focused tests:** injected time, exact boundaries, retry rounding, concurrent consumers, busy handlers and real SQLite write suppression; tests the rule and its integration without sleeping through minutes.
+- **S/E · Failed responses:** check writes and abort interrupted responses with `http.ErrAbortHandler`; avoids reporting a partial body as complete. Limiter handling is direct support; JSON/CSV/download/health handling belongs to broader cleanup.
 
-The brief asked to get the project running locally and implement a basic,
-readable, maintainable **leaky-bucket request limiter**, process-local and global
-across clients, at **10 requests per minute**. The expected take-home duration
-was 30–45 minutes, followed by a small requirements change during live review.
+Evidence: [limiter](internal/app/rate_limit.go), [wiring](cmd/server/main.go), [focused tests](internal/app/rate_limit_test.go).
 
-The core implementation is [`internal/app/rate_limit.go`](internal/app/rate_limit.go)
-plus one wrapper around the production business router in
-[`cmd/server/main.go`](cmd/server/main.go). It introduces no limiter dependency,
-database table, external service, background worker or per-client bucket.
+## Expanded identity, ownership and storage
 
-The brief did not fully specify burst capacity, queueing or overflow behavior.
-Our explicit choices are:
+- **E · Distinct actors:** explicitly requested persisted attribution and private contacts/files; configured case-sensitive actor labels replace the earlier single `local-demo` identity. Labels are not verified email identities.
+- **E, choice · Ephemeral credentials:** independent random 256-bit tokens, memory-only, printed after both binds, rotated on restart; avoids spoofable email bearers without adding an identity provider or stored secrets. The local operator sees all tokens.
+- **E, choice · Auth boundaries:** snapshot token mappings, constant-time token comparison, duplicate-header rejection, fail-closed configuration and Bearer challenges; avoids ambiguous/mutable credential state. The auth endpoint verifies identity; it does not issue tokens.
+- **E · Ownership end to end:** server-derived `owner_id`, actor foreign keys and filtering on CRUD/list/import/export/file/download paths; fulfills isolation. Foreign valid IDs return the same missing-resource response; no client-supplied owner is trusted.
+- **E, choice · Private reports:** filter aggregates by actor; prevents reports from exposing another actor's activity. This supports requested isolation but removes the starter's shared report view; no admin-report API was added.
+- **E, choice · Legacy refusal:** inspect existing schema/integrity read-only and refuse unsupported databases; ownership cannot be reliably inferred from incomplete/synthetic audit history. No first-caller adoption or automatic migration; fresh data or explicit offline migration is required.
+- **E · Timestamp/cursor consistency:** schema v2 canonical fixed-width UTC preserves nanoseconds and SQL-default compatibility; fixes repeated/missed boundary rows. Actor-bound, size-bounded cursors retain live keyset behavior after anchor deletion; old cursors break and there is no snapshot guarantee.
+- **E · SQLite concurrency:** one pooled connection, WAL and five-second busy timeout, with pragmas reapplied per connection and escaped database paths; addresses SQLite contention and preserves foreign keys. Local DB work is serialized; cross-process contention remains possible.
+- **E, choice · Atomic audit:** mutation and audit share a transaction; prevents successful writes with missing audit history. Audit failure now rejects the mutation. Original `export`/`download`/`view` names remain, logged before output as attempts, not proof of delivery.
+- **E · File durability/cleanup:** exclusive creation, bounded copying, cancellation checks, sync/close checks and removal of only this attempt's failed file; preserves duplicate winners and avoids false success. Filesystem and SQLite are not crash-atomic.
+- **E, choice · Local permissions:** new directories use 0700 and new database/blob files 0600; limits accidental local disclosure. Existing permissions are not silently changed; OS administrators are outside the isolation boundary.
 
-- A **capacity-one policer**: the first request is immediate, then one admission
-  every six seconds. Elapsed time drains the bucket lazily on the next request.
-- Overflow receives JSON `429` and rounded-up `Retry-After`; there is no queue.
-  Rejections add no work, and idle time does not accumulate burst credit.
-- One shared instance per server process, protected by a mutex. The downstream
-  handler runs after unlocking. Restart resets state; processes do not coordinate.
-- The business listener charges requests before authentication and routing,
-  including failed requests. This is a chosen scope/precedence policy, not a
-  separate requirement in the brief. Health originally shared that listener;
-  separation was explicitly requested afterward, with exemption as the supporting
-  liveness policy for the new listener.
+Evidence: [auth](internal/auth/auth.go), [schema/store](internal/store/store.go), [contacts](internal/store/contacts.go), [files](internal/store/files.go), [reports](internal/store/activity.go).
 
-This interpretation favors simple, predictable spacing over bursts or queued
-shaping. It limits admissions, not overlapping long-running handlers, fairness
-or aggregate traffic across several server processes. A different burst or
-queue policy would need an explicit decision in a live requirements change.
+## Expanded API and export contracts
 
-## 2. Supporting work for a reliable limiter submission
+- **E, choice · Bounded contact input:** 1 MiB contact body, 8 MiB import body, incremental validation and 10,000-item cap; bounds each admitted request before writes. Name/company/phone/email limits and control-character rejection add intentional restrictions.
+- **E, choice · Strict JSON:** exact, unique, non-null writable string fields and `application/json`; surfaces ambiguous client input. Unknown/server metadata is rejected; GET→PUT/import requires writable-field projection. This is stricter than ownership security alone requires.
+- **E · Validation/error policy:** invalid fields/query values return 400, excessive body size 413, unsupported media 415; makes rejection explicit instead of silently defaulting. Encode JSON before committing status; add nosniff and check encoding/streaming failures.
+- **E · Contact response contracts:** return real creation timestamps after updates and consistent empty arrays; fixes misleading metadata/null collections. Preserve full PUT replacement: omitted writable fields still clear, rather than becoming PATCH.
+- **E, choice · Upload contract:** exactly one `file` part, no extra fields, 100 MiB content plus bounded multipart overhead; prevents owner injection and uncontrolled forms. Validate the parser-normalized basename, use UUID storage keys, clean temporary parts, and fall back to a safe media type.
+- **E · Download contract:** verify owned metadata and regular-file/size consistency before delivery; format attachment names safely and set length/nosniff/sandbox headers. Prevents malformed headers or serving known inconsistent blobs; interrupted output aborts.
+- **E, choice · Spreadsheet-safe CSV:** escape formula-leading cells; reduces spreadsheet execution risk while leaving stored JSON unchanged. Also prefixes `+` phone numbers; CSV keeps eight columns/second-level dates and is not a lossless backup.
+- **E · Ordering/report boundaries:** deterministic ID tie-breaks for file lists/exports and UTC-inclusive report cutoffs; prevents ambiguous ordering and local-time/DST inconsistencies. A report is computed before its own `view` event, which appears only in a later report.
 
-These changes directly support implementing or checking the original behavior;
-they do not require redesigning the CRM:
+Evidence: [request validation](internal/api/requests.go), [contacts/CSV](internal/api/contacts.go), [files](internal/api/files.go), [report cutoff](internal/api/reports.go).
 
-| Supporting work | Why it belongs near the assignment | Boundary |
-|---|---|---|
-| One production middleware wrapper; leave the reusable router independently usable | Ensures the shipped server enforces the global policy without accidentally creating one bucket per route/client or throttling the existing handler benchmarks | The dual-listener redesign is later expanded scope |
-| Deterministic injected-clock tests | Verify first admission, exact six-second boundary, rounded retry delay, idle behavior and rejected attempts without minute-long sleeps | A test seam; production still uses the real clock |
-| Concurrent admission and busy-handler checks | Verify shared state is synchronized and the lock is not held while handlers work | Race checks exercise finite schedules; they do not prove absence of every race |
-| Focused router/SQLite rejection tests | Show that a rejected write never reaches storage and accepted behavior survives the wrapper | A small integration test suffices; full-app BDD is not required for this |
-| Limiter response/error handling, preserved request logging and safe test cleanup | A failed rejection response must not be silently completed; rejected requests must still be observable; tests must release their temporary store/server resources | Full-app error cleanup, logging/audit policy and all baseline lint fixes are separate expansion |
-| README assumptions and focused validation | Make the capacity, overflow, scope and process-local limitations explainable, and establish that the starter still runs | New authentication, schema migration and broad endpoint policy changes are unnecessary for the limiter |
+## Expanded health, startup and lifecycle
 
-The initial implementation commit,
-[`a82f612`](https://github.com/intel352/interview-public/commit/a82f612a6415c36556d711d74261a15cf6eeaa08),
-is a useful small review starting point, but is **not a perfectly isolated minimal
-assignment commit**: it also includes the subsequently requested Go upgrade and
-modernization. Later cleanup/review work followed it. Classify changes by purpose,
-not simply by commit date.
+- **E · Separate health server:** explicitly requested API port + 1 default; independent liveness remains available when the business bucket is full. Health has no business routes, and the API listener has no health route; exemption is the supporting liveness policy.
+- **E · Address/bind handling:** health override, IPv4/IPv6, independent ephemeral ports by default for API port 0, overflow/collision checks and partial-bind cleanup; makes the new two-listener feature usable. Both bind before credentials are printed.
+- **E, choice · Loopback and deadlines:** numeric loopback only, 5s headers, 30s read/write/request, 60s idle and 16 KiB headers; limits unintended exposure and resource occupation. LAN/hostname binds and sufficiently slow transfers are no longer supported.
+- **E · Coordinated shutdown:** returning startup helpers, signal context, five-second grace then cancellation/forced close, error propagation and joined server loops; avoids abrupt exits/ignored failures and releases shared storage afterward. Arbitrary handlers/readers still must cooperate.
+- **E · Empty-store startup:** remove contact-count initialization gate; a fresh database or deleting the last contact must not disable files or later writes. Seeding becomes optional.
+- **E · Seed completion/retry:** one DB transaction for actors/data/audit/completion marker; ordinary failure rolls back rows and removes only new blobs. Fixes partial completion and false “already seeded”; repeat after completion is a no-op, including changed options.
+- **E · Seed identity/files:** distribute configured totals across actors, use random blob IDs and actual import/upload audits alongside synthetic history; makes isolated fixtures usable without overwriting existing blobs. Synthetic history is illustrative, not evidence of real user actions.
 
-## 3. Expanded scope and the reasoning behind it
+Evidence: [server](cmd/server/main.go), [health router](internal/app/health.go), [seeding](internal/seed/seed.go).
 
-The candidate subsequently requested a Go upgrade/modernization, full security
-and Go-practice review, fixes for existing findings, full-app BDD/API testing,
-separate health serving, distinct persisted actors and private contacts/files,
-and a review for regressions introduced by our own changes. Those requests
-authorized the expansion; the detailed policies below remain implementation
-choices and are not retroactively requirements of the original assignment.
+## Expanded tooling, tests and documentation
 
-| Major group | Source of scope and rationale | Compatibility/tradeoff; separability |
-|---|---|---|
-| Go 1.27.3 and built-in modernization | Explicit later request. Update the Go directive and apply supported idioms; use compatible analysis tooling | Raises the required compiler version. Independent of the algorithm and can be reviewed separately; dependency versions and Java were not upgraded |
-| Full security/idiom/lint cleanup | Later request to review and fix all verified findings, including baseline issues. Check errors, close resources, assert benchmark statuses and improve shutdown/storage behavior | Broad cleanup adds review surface. Only the narrow limiter/test cleanup above is needed for the original task; the rest can be a separate hardening change |
-| HTTP and input boundaries | Implementation choices under that broader request: bounded JSON/import/file input, field validation, safe download headers, numeric loopback binding and server deadlines | Missing JSON media types, unknown/duplicate/case-mismatched/null fields, full GET objects used as PUT bodies and invalid query values may now be rejected. Fixed deadlines can interrupt slow transfers; loopback-only prevents LAN use. Exact limits and strict DTO policy were not prescribed by the assignment |
-| Local credentials and actor isolation | Distinct actors, persisted attribution and private contacts/files were explicitly requested later. Independent random startup tokens avoid restoring spoofable email-bearer identity; owners are server-derived and checked on every applicable path | Tokens rotate on restart and are visible to the local operator. This is a local demo, not external identity verification. Owner columns, report filtering and actor-bound cursors change the original shared-data contract. Identity, ownership, report scoping and their tests belong together, separate from the limiter |
-| Ownership/schema policy | Supporting the requested isolation required an explicit owner model. We chose foreign-key constraints and fail-closed refusal of legacy shared schemas because audit history cannot reliably reconstruct ownership | No first-caller adoption or automatic destructive migration. Old data needs a fresh directory or a separately reviewed explicit offline migration. Go and Java no longer share an interchangeable schema. The precise migration policy is our choice, not a limiter requirement |
-| SQLite, audit and file consistency | Under broad reliability review: one-connection/WAL/busy-timeout policy, mutation+audit transactions, checked copy/sync/close and cleanup, duplicate-file preservation | Serializes local DB operations; audit failure now fails mutations instead of silently losing history. Export/download/report audit names stay stable, but denote attempts, not guaranteed delivery. SQLite and files are not power-loss atomic. This is separable storage hardening |
-| Separate health server | Explicit later request: health on its own HTTP server, default API port + 1. Health cannot consume or be rejected by the business limiter; both listeners stop together | Health moves off the API port. Overrides, IPv6, port-zero handling, partial binds and dual shutdown are supporting work for this new feature, not the original limiter. Health is liveness, not readiness |
-| Seed/startup, pagination and report corrections | Later full-app and regression review exposed contact-count initialization, partial seed completion and timestamp/cutoff problems. Explicit completion state, ordinary-failure rollback/retry and canonical UTC timestamps make those behaviors predictable | Zero-contact/fresh databases can now serve; seed completion no longer means “has contacts.” Timestamp/schema and cursor compatibility are documented. These fixes are worthwhile independently but not necessary to add a request limiter |
-| CSV and collection contracts | Discretionary policy choices under the broad hardening request: spreadsheet-safe cells and consistent empty arrays | Formula protection also prefixes international phone numbers; CSV is not a lossless backup. JSON retains exact stored text. Empty arrays replace prior `null` collections. These choices can be reviewed/deferred independently of the limiter |
-| Full-app BDD and convenient API workflow | Explicit later request to cover all app features and make API testing practical. Native Go tests use real HTTP/SQLite/files, generated credentials, an endpoint matrix and Make targets | Much larger than focused limiter tests; no framework or external service was added. Deterministic units and fault injection remain distinct from TCP integration |
-| Behavioral test-strength review | Explicit latest request to recheck every case for realistic behavior. Added exact persisted fields/owners/audit tuples, HTTP interruption/cancellation, usable rotated credentials, two-actor operations→reports, rollback/recovery, independent size limits and correct selectable scenarios | Tests/docs only; no runtime behavior changed in this follow-up. The full matrix is 123 top-level tests/356 named nodes, including 60 BDD groups. This is additional assurance, not the minimal assignment or proof of every possible scenario |
+- **E · Go 1.27.3/modernization:** explicitly requested upgrade from 1.26.3 and supported built-in modernization; keeps the chosen toolchain current. Earlier mechanical changes can be superseded by later redesigns; dependencies and Java were not upgraded.
+- **S/E · Test/benchmark lifecycle:** return before `os.Exit` so cleanup runs; check close/status/body-I/O errors, bound clients and use benchmark helpers/`B.Loop`. Makes results trustworthy; all 14 benchmark workloads remain, but mutation benchmarks grow disposable data.
+- **E · Full-app BDD/API workflow:** explicitly requested endpoint coverage and convenient testing; native Go/Make targets use generated credentials, actual HTTP/SQLite/files and an explicit matrix. No BDD framework or CI workflow was added; ordinary tests do not run benchmarks.
+- **E · Test realism:** exact persisted fields/owners/audit tuples, HTTP operations→reports, usable rotated tokens, symmetric isolation, real interrupted bodies/cancellation and rollback/retry; closes gaps that status/count-only assertions missed.
+- **E · Independent expectations/fixtures:** documented byte/count limits, real exact-size files, original legacy schema, controlled timestamp fixtures and synchronized concurrency; catches policy drift and reproducible edge failures. Dependent workflow phases are no longer selectively runnable subtests.
+- **E · Analysis/error cleanup:** compatible lint, race checks and independent reviews prompted checked errors/resource handling; avoids treating pre-existing warnings as acceptable. No blanket suppression or configuration weakening; finite checks are not proof of all defects.
+- **E · Explicit documentation:** README commands, [API_TESTING](API_TESTING.md), [COMPATIBILITY](COMPATIBILITY.md) and [HARDENING](HARDENING.md) expose changed contracts and test layers; prevents portraying optional hardening as assignment requirements or the demo as production-ready.
 
-### Corrections to our own changes
+## History corrections and review boundaries
 
-Earlier hardening collapsed all identities into `local-demo` and renamed stable
-audit action keys with `_attempt`. Those were unnecessary losses of attribution
-and compatibility. Distinct actors and the original `export`/`download`/`view`
-keys are restored. We also fixed the seed CLI registering actors outside its
-transaction. These are corrections to our implementation, not new benefits to
-count as requested features or alleged starter traps.
+- **`a82f612`:** limiter plus requested toolchain work; useful small starting point, but not a pure assignment-only commit.
+- **`b823d4b` / `02ae9b0`:** narrow cleanup followed by broader hardening. The temporary single-actor model and renamed audit keys were later corrected; they are not final features.
+- **`43ae2d8`:** restores distinct attribution and original audit names; adds requested ownership/health/BDD and compatibility fixes. Seed actor registration outside its transaction was caught during local development, not a separately reverted published commit.
+- **`12b4e29`:** strengthens behavioral tests/docs without runtime changes. This document revision also changes documentation only.
+- **Separable review groups:** toolchain; general hardening; actor/schema/migration; health; broad tests. All remain authorized in this draft; coupled schema/auth fixtures make blind cherry-picking unsafe.
+- **Interview focus:** explain the small limiter first, then label the expansion. Thousands of lines of follow-up work are not a 30–45-minute requirement.
 
-Other restrictions are deliberate, not hidden fixes: writable-field projection
-for PUT/import, numeric-loopback-only operation, strict input handling and
-spreadsheet-modified CSV. See [COMPATIBILITY.md](COMPATIBILITY.md) for the full
-original-to-current comparison and [HARDENING.md](HARDENING.md) for policies.
+## Accuracy and limits
 
-## How to present or separate the work
-
-For the interview, start with the small limiter, its assumptions and focused
-tests. Be ready to explain the mutex scope, lazy drain calculation, capacity-one
-tradeoff, rejection precedence and process-local reset behavior. Then explicitly
-label the rest as follow-up work requested after the original brief.
-
-Reasonable separate review groups are: (1) toolchain/modernization, (2) general
-input/storage/lifecycle hardening and baseline fixes, (3) actor ownership/schema
-and migration, (4) separate health serving, and (5) broader BDD/test-quality work.
-They remain in this authorized draft; nothing has been reverted. Mechanical
-cherry-picking is not promised: current fixtures depend on the new schema/auth,
-and ownership, cursor/report filtering, seed behavior and their tests are coupled.
-A future scope split should be validated as its own change rather than deleting
-pieces without checking dependencies.
-
-No further expansion is implied. Quotas/retention, streaming very large exports,
-production identity provisioning, multi-process limiting and crash recovery are
-separate product/operational decisions. The admission limiter does not solve them.
-
-## Validation and limits
-
-The strengthened test sources passed native Go 1.27.3 full normal and race suites;
-golangci-lint 2.15.0 reports zero issues. The test review distinguished helper and
-middleware units, recorder/router integration, real TCP/SQLite/filesystem flows,
-and in-process production startup/lifecycle tests. All 14 benchmarks were reviewed
-but not rerun in this test-strength follow-up. No Docker or custom binary build was
-used for it. Earlier coverage/runtime/advisory measurements must retain their
-original commit attribution rather than being claimed as newly rerun results.
-
-See [API_TESTING.md](API_TESTING.md) for exact scenarios and omissions. Passing
-tests and race checks establish executed behavior, not exhaustive coverage,
-production security, OS-signal testing or power-loss guarantees. The expanded
-review found test/documentation weaknesses, but no additional confirmed runtime
-defect requiring a production-source change in that follow-up.
+- **Checked:** full `d35ce33..12b4e29` diff, five implementation commits, final code/tests and independent runtime/test-documentation reviewers; rationale reflects recorded requests or explicit choices, not invented historical intent.
+- **Existing validation at `12b4e29`:** 123 top-level tests/356 named nodes, 60 BDD groups, full normal/race suites and lint zero issues. Documentation-only updates do not constitute a fresh runtime, coverage, benchmark or advisory scan.
+- **Unchanged limits:** local-operator trust; no data/audit quotas; whole-collection exports/lists; no distributed limiter or power-loss guarantee. [API_TESTING](API_TESTING.md) lists untested failure modes and distinguishes helpers, recorder integration and real TCP behavior.
