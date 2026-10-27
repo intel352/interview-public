@@ -109,6 +109,44 @@ func TestContactMutationsRollbackOnAuditFailure(t *testing.T) {
 	}
 }
 
+func TestImportConstraintFailureRollsBackEarlierRowsAndAllowsRetry(t *testing.T) {
+	for _, conflict := range []string{"existing contact", "duplicate within batch"} {
+		t.Run(conflict, func(t *testing.T) {
+			s := testStore(t)
+			original := &Contact{ID: "original", FirstName: "Keep me"}
+			if err := s.CreateContact(t.Context(), "local-demo", original); err != nil {
+				t.Fatal(err)
+			}
+			batch := []Contact{{ID: "first", FirstName: "First"}, {ID: "original", FirstName: "Replacement"}}
+			if conflict == "duplicate within batch" {
+				batch[1].ID = "first"
+			}
+			// The first INSERT succeeds before SQLite rejects the second one.
+			if imported, err := s.ImportContacts(t.Context(), "local-demo", batch); err == nil || imported != 0 {
+				t.Fatalf("partial import: count=%d error=%v", imported, err)
+			}
+			contacts, err := s.ExportContacts(t.Context(), "local-demo")
+			if err != nil || len(contacts) != 1 || contacts[0].ID != original.ID || contacts[0].FirstName != original.FirstName || contacts[0].OwnerID != original.OwnerID || !contacts[0].CreatedAt.Equal(original.CreatedAt) || !contacts[0].UpdatedAt.Equal(original.UpdatedAt) || activityCount(t, s) != 1 {
+				t.Fatalf("failed import changed durable rows: contacts=%+v error=%v", contacts, err)
+			}
+			batch[1] = Contact{ID: "second", FirstName: "Second"}
+			if imported, err := s.ImportContacts(t.Context(), "local-demo", batch); err != nil || imported != 2 {
+				t.Fatalf("retry failed after rollback: count=%d error=%v", imported, err)
+			}
+			for _, expected := range batch {
+				actual, err := s.GetContact(t.Context(), "local-demo", expected.ID)
+				if err != nil || actual.FirstName != expected.FirstName || actual.OwnerID != "local-demo" {
+					t.Fatalf("retried import row=%+v error=%v; want %+v", actual, err, expected)
+				}
+			}
+			var importAudits int
+			if err := s.DB().QueryRowContext(t.Context(), `SELECT COUNT(*) FROM activity_log WHERE user_id='local-demo' AND action='import' AND resource_type='contacts'`).Scan(&importAudits); err != nil || importAudits != 1 || activityCount(t, s) != 2 {
+				t.Fatalf("retry audit records=%d error=%v", importAudits, err)
+			}
+		})
+	}
+}
+
 func activityCount(t *testing.T, s *Store) int {
 	t.Helper()
 	var count int
@@ -127,7 +165,8 @@ func TestConcurrentWritersAllPersistWithAudit(t *testing.T) {
 	for i := range writers {
 		wg.Go(func() {
 			<-start
-			errorsCh <- s.CreateContact(t.Context(), "local-demo", &Contact{ID: fmt.Sprintf("contact-%d", i)})
+			actor := []string{"local-demo", "seed"}[i%2]
+			errorsCh <- s.CreateContact(t.Context(), actor, &Contact{ID: fmt.Sprintf("contact-%d", i), FirstName: fmt.Sprintf("Writer %d", i)})
 		})
 	}
 	close(start)
@@ -138,9 +177,21 @@ func TestConcurrentWritersAllPersistWithAudit(t *testing.T) {
 			t.Errorf("concurrent write: %v", err)
 		}
 	}
-	count, err := s.CountContacts(t.Context(), "local-demo")
+	count, err := s.CountAllContacts(t.Context())
 	if err != nil || count != writers || activityCount(t, s) != writers {
 		t.Fatalf("contacts=%d, err=%v; want %d contacts and audits", count, err, writers)
+	}
+	for i := range writers {
+		actor := []string{"local-demo", "seed"}[i%2]
+		id := fmt.Sprintf("contact-%d", i)
+		contact, err := s.GetContact(t.Context(), actor, id)
+		if err != nil || contact.FirstName != fmt.Sprintf("Writer %d", i) || contact.OwnerID != actor {
+			t.Fatalf("writer %d persisted contact=%+v error=%v", i, contact, err)
+		}
+		var matchingAudits int
+		if err := s.DB().QueryRowContext(t.Context(), `SELECT COUNT(*) FROM activity_log WHERE user_id=? AND action='create' AND resource_type='contact' AND resource_id=?`, actor, id).Scan(&matchingAudits); err != nil || matchingAudits != 1 {
+			t.Fatalf("writer %d matching audits=%d error=%v", i, matchingAudits, err)
+		}
 	}
 }
 
@@ -151,8 +202,10 @@ func TestCanceledWriterWaitingForConnection(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		if err := conn.Close(); err != nil {
-			t.Error(err)
+		if conn != nil {
+			if err := conn.Close(); err != nil {
+				t.Error(err)
+			}
 		}
 	})
 	ctx, cancel := context.WithCancel(t.Context())
@@ -177,6 +230,19 @@ func TestCanceledWriterWaitingForConnection(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("canceled writer remained blocked")
+	}
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+	conn = nil
+	if count, err := s.CountAllContacts(t.Context()); err != nil || count != 0 || activityCount(t, s) != 0 {
+		t.Fatalf("canceled waiter persisted a mutation: contacts=%d error=%v", count, err)
+	}
+	if err := s.CreateContact(t.Context(), "local-demo", &Contact{ID: "recovered"}); err != nil {
+		t.Fatalf("connection was not reusable after cancellation: %v", err)
+	}
+	if count, err := s.CountAllContacts(t.Context()); err != nil || count != 1 || activityCount(t, s) != 1 {
+		t.Fatalf("recovery mutation: contacts=%d error=%v", count, err)
 	}
 }
 
@@ -209,14 +275,78 @@ func TestFileAuditFailureAndCopyFailureCleanUp(t *testing.T) {
 		}
 		assertNoFiles(t, s)
 	})
+	t.Run("cancellation on final read", func(t *testing.T) {
+		s := testStore(t)
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		err := s.CreateFile(ctx, "local-demo", &File{ID: "upload"}, cancelEOFReader{cancel: cancel})
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("got %v, want cancellation even when the final bytes accompany EOF", err)
+		}
+		assertNoFiles(t, s)
+	})
 	t.Run("size", func(t *testing.T) {
 		s := testStore(t)
-		err := s.CreateFile(t.Context(), "local-demo", &File{ID: "upload"}, zeroReader{})
+		err := s.CreateFile(t.Context(), "local-demo", &File{ID: "upload"}, io.LimitReader(zeroReader{}, (100<<20)+1))
 		if !errors.Is(err, ErrFileTooLarge) {
 			t.Fatalf("got %v, want size limit", err)
 		}
 		assertNoFiles(t, s)
 	})
+}
+
+func TestFileAtExactSizeLimitPersistsAndClosesCleanly(t *testing.T) {
+	// Keep the public boundary independent of MaxFileSize so changing the
+	// implementation constant cannot silently change the contract tested here.
+	const allowedBytes int64 = 100 << 20
+	dir := filepath.Join(t.TempDir(), "exact-size-upload")
+	s, err := New(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := s.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	if err := s.RegisterActors(t.Context(), []string{"alice"}); err != nil {
+		t.Fatal(err)
+	}
+	upload := &File{ID: "exact-size", Filename: "boundary.bin", ContentType: "application/octet-stream"}
+	// Generate bytes as the store reads them; no 100 MiB allocation is needed.
+	if err := s.CreateFile(t.Context(), "alice", upload, io.LimitReader(zeroReader{}, allowedBytes)); err != nil {
+		t.Fatalf("exact 100 MiB upload was rejected: %v", err)
+	}
+	file, metadata, err := s.OpenFile(t.Context(), "alice", upload.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, statErr := file.Stat()
+	readBytes, readErr := io.Copy(io.Discard, file)
+	closeErr := file.Close()
+	if statErr != nil || readErr != nil || closeErr != nil {
+		t.Fatalf("read complete upload: stat=%v read=%v close=%v", statErr, readErr, closeErr)
+	}
+	if info.Size() != allowedBytes || readBytes != allowedBytes || metadata.Size != allowedBytes || upload.Size != allowedBytes || metadata.OwnerID != "alice" {
+		t.Fatalf("exact-size upload changed: disk=%d read=%d metadata=%+v returned=%+v", info.Size(), readBytes, metadata, upload)
+	}
+	var matchingAudits int
+	if err := s.DB().QueryRowContext(t.Context(), `SELECT COUNT(*) FROM activity_log WHERE user_id='alice' AND action='upload' AND resource_type='file' AND resource_id='exact-size'`).Scan(&matchingAudits); err != nil || matchingAudits != 1 || activityCount(t, s) != 1 {
+		t.Fatalf("upload audit count=%d error=%v", matchingAudits, err)
+	}
+	files, err := s.ListFiles(t.Context(), "alice")
+	if err != nil || len(files) != 1 || files[0].ID != upload.ID {
+		t.Fatalf("persisted file records=%+v error=%v", files, err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(dir); err != nil {
+		t.Fatalf("clean test-owned large upload: %v", err)
+	}
+	if _, err := os.Stat(dir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("test-owned upload directory remains after cleanup: %v", err)
+	}
 }
 
 type failingReader struct{ err error }
@@ -231,6 +361,13 @@ func (r cancelReader) Read(p []byte) (int, error) {
 }
 
 type zeroReader struct{}
+
+type cancelEOFReader struct{ cancel context.CancelFunc }
+
+func (r cancelEOFReader) Read(p []byte) (int, error) {
+	r.cancel()
+	return copy(p, "final bytes"), io.EOF
+}
 
 func (zeroReader) Read(p []byte) (int, error) {
 	clear(p)
@@ -264,31 +401,59 @@ func TestInvalidFileIDs(t *testing.T) {
 
 func TestConcurrentDuplicateFiles(t *testing.T) {
 	s := testStore(t)
-	results := make(chan error, 2)
+	type result struct {
+		writer int
+		err    error
+	}
+	actors := []string{"local-demo", "seed"}
+	contents := []string{"Alice's original bytes", "Bob's distinct replacement bytes"}
+	results := make(chan result, 2)
 	start := make(chan struct{})
 	var wg sync.WaitGroup
-	for range 2 {
+	for i := range 2 {
 		wg.Go(func() {
 			<-start
-			results <- s.CreateFile(t.Context(), "local-demo", &File{ID: "same-file"}, strings.NewReader("original"))
+			file := &File{ID: "same-file", Filename: fmt.Sprintf("writer-%d.txt", i), ContentType: "text/plain"}
+			results <- result{i, s.CreateFile(t.Context(), actors[i], file, strings.NewReader(contents[i]))}
 		})
 	}
 	close(start)
 	wg.Wait()
 	close(results)
 	accepted, duplicates := 0, 0
-	for err := range results {
+	winner := -1
+	for result := range results {
 		switch {
-		case err == nil:
+		case result.err == nil:
 			accepted++
-		case errors.Is(err, ErrFileExists):
+			winner = result.writer
+		case errors.Is(result.err, ErrFileExists):
 			duplicates++
 		default:
-			t.Errorf("unexpected error: %v", err)
+			t.Errorf("unexpected error: %v", result.err)
 		}
 	}
 	if accepted != 1 || duplicates != 1 || activityCount(t, s) != 1 {
 		t.Fatalf("accepted=%d duplicates=%d; want one complete upload", accepted, duplicates)
+	}
+	file, metadata, err := s.OpenFile(t.Context(), actors[winner], "same-file")
+	if err != nil {
+		t.Fatal(err)
+	}
+	content, readErr := io.ReadAll(file)
+	closeErr := file.Close()
+	if readErr != nil || closeErr != nil || string(content) != contents[winner] || metadata.Size != int64(len(contents[winner])) || metadata.OwnerID != actors[winner] || metadata.Filename != fmt.Sprintf("writer-%d.txt", winner) {
+		t.Fatalf("winner's bytes/metadata changed: content=%q metadata=%+v read=%v close=%v", content, metadata, readErr, closeErr)
+	}
+	if _, err := s.GetFile(t.Context(), actors[1-winner], "same-file"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("losing actor can read winning metadata: %v", err)
+	}
+	var auditActor, action, resource, resourceID string
+	if err := s.DB().QueryRowContext(t.Context(), `SELECT user_id, action, resource_type, resource_id FROM activity_log`).Scan(&auditActor, &action, &resource, &resourceID); err != nil {
+		t.Fatal(err)
+	}
+	if auditActor != actors[winner] || action != "upload" || resource != "file" || resourceID != "same-file" {
+		t.Fatalf("audit does not describe the winning upload: %q %q %q %q", auditActor, action, resource, resourceID)
 	}
 }
 

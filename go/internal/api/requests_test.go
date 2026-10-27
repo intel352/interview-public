@@ -85,17 +85,22 @@ func TestDecodeContactRequiresExactUniqueStringFields(t *testing.T) {
 }
 
 func TestDecodeContactExactBodyAndFieldLimits(t *testing.T) {
+	// Keep the documented contract independent from implementation constants.
+	const contactBodyLimit = 1 << 20
 	body := fmt.Sprintf(`{"first_name":%q,"last_name":%q,"phone":%q,"company":%q}`, strings.Repeat("界", 256), strings.Repeat("x", 256), strings.Repeat("1", 64), strings.Repeat("y", 256))
 	for _, extra := range []int{0, 1} {
-		payload := body + strings.Repeat(" ", maxContactBody-len(body)+extra)
+		payload := body + strings.Repeat(" ", contactBodyLimit-len(body)+extra)
 		r := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(payload))
 		r.Header.Set("Content-Type", "application/json; charset=utf-8")
 		// Exercise the streaming bound rather than only Content-Length rejection.
 		r.ContentLength = -1
 		w := httptest.NewRecorder()
-		_, ok := decodeContact(w, r)
+		contact, ok := decodeContact(w, r)
 		if extra == 0 && !ok {
 			t.Fatalf("exact limit rejected: %d %s", w.Code, w.Body.String())
+		}
+		if extra == 0 && (contact.FirstName != strings.Repeat("界", 256) || contact.LastName != strings.Repeat("x", 256) || contact.Phone != strings.Repeat("1", 64) || contact.Company != strings.Repeat("y", 256)) {
+			t.Fatalf("exact field limits must preserve decoded values: %+v", contact)
 		}
 		if extra == 1 && (ok || w.Code != http.StatusRequestEntityTooLarge) {
 			t.Fatalf("over-limit accepted=%v status=%d", ok, w.Code)
@@ -103,15 +108,51 @@ func TestDecodeContactExactBodyAndFieldLimits(t *testing.T) {
 	}
 }
 
+func TestDecodeContactRejectsEveryOverlongField(t *testing.T) {
+	for _, scenario := range []struct {
+		field string
+		value string
+	}{
+		{"first_name", strings.Repeat("界", 257)},
+		{"last_name", strings.Repeat("a", 257)},
+		{"company", strings.Repeat("b", 257)},
+		{"phone", strings.Repeat("1", 65)},
+		// 255 bytes with individually valid local/domain label lengths.
+		{"email", strings.Repeat("a", 64) + "@" + strings.Repeat("b", 63) + "." + strings.Repeat("c", 63) + "." + strings.Repeat("d", 58) + ".com"},
+	} {
+		t.Run(scenario.field, func(t *testing.T) {
+			for _, imported := range []bool{false, true} {
+				body := fmt.Sprintf(`{%q:%q}`, scenario.field, scenario.value)
+				if imported {
+					body = "[" + body + "]"
+				}
+				r := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(body))
+				r.Header.Set("Content-Type", "application/json")
+				w := httptest.NewRecorder()
+				var accepted bool
+				if imported {
+					_, accepted = decodeContactImport(w, r)
+				} else {
+					_, accepted = decodeContact(w, r)
+				}
+				if accepted || w.Code != http.StatusBadRequest {
+					t.Errorf("import=%v accepted=%v status=%d, want rejected400", imported, accepted, w.Code)
+				}
+			}
+		})
+	}
+}
+
 func TestDecodeImportLimitsAndShape(t *testing.T) {
+	const importCountLimit = 10_000 // Public contract, not the implementation value.
 	for _, tt := range []struct {
 		name, body string
 		status     int
 		count      int
 	}{
 		{"empty", `[]`, 200, 0},
-		{"exact count", "[" + strings.TrimSuffix(strings.Repeat("{},", maxImportContacts), ",") + "]", 200, maxImportContacts},
-		{"too many", "[" + strings.TrimSuffix(strings.Repeat("{},", maxImportContacts+1), ",") + "]", 400, 0},
+		{"exact count", "[" + strings.TrimSuffix(strings.Repeat("{},", importCountLimit), ",") + "]", 200, importCountLimit},
+		{"too many", "[" + strings.TrimSuffix(strings.Repeat("{},", importCountLimit+1), ",") + "]", 400, 0},
 		{"not array", `{}`, 400, 0},
 		{"null", `null`, 400, 0},
 		{"null entry", `[null]`, 400, 0},
@@ -136,8 +177,9 @@ func TestDecodeImportLimitsAndShape(t *testing.T) {
 }
 
 func TestDecodeImportBodyLimit(t *testing.T) {
+	const importBodyLimit = 8 << 20 // Public contract, not the implementation value.
 	for _, extra := range []int{0, 1} {
-		r := httptest.NewRequest(http.MethodPost, "/", strings.NewReader("[]"+strings.Repeat(" ", maxImportBody-2+extra)))
+		r := httptest.NewRequest(http.MethodPost, "/", strings.NewReader("[]"+strings.Repeat(" ", importBodyLimit-2+extra)))
 		r.ContentLength = -1
 		r.Header.Set("Content-Type", "application/json")
 		w := httptest.NewRecorder()

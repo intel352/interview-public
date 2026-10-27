@@ -48,36 +48,37 @@ func TestBDDGlobalRateLimitAcrossHTTPConsumers(t *testing.T) {
 		}
 	}
 
-	t.Run("Given_health_requests_When_the_first_API_wave_arrives_Then_only_one_mutation_is_admitted", func(t *testing.T) {
-		assertHealthAvailable(t)
-		admitted = append(admitted, whenBDDConsumersCreate(t, consumers, "first"))
-		thenBDDCreationsAndAudits(t, world, admitted)
-	})
+	// These are sequential phases of one scenario, not independently selectable
+	// subtests: the second phase depends on the first wave filling the bucket.
+	// When the first API wave follows health requests, Then one write persists.
+	assertHealthAvailable(t)
+	admitted = append(admitted, whenBDDConsumersCreate(t, consumers, "first"))
+	thenBDDCreationsAndAudits(t, world, admitted)
 
-	t.Run("Given_a_full_API_bucket_When_health_is_checked_Then_health_succeeds_without_changing_the_drain_boundary", func(t *testing.T) {
-		assertHealthAvailable(t)
-		// The wrong listener exposes no business API, even with a valid token.
-		health.token = world.token
-		response := health.request(t, http.MethodGet, "/api/contacts", "", nil)
-		thenStatus(t, response, http.StatusNotFound)
+	// Given a full API bucket, When health is checked, Then health succeeds
+	// without changing the next business admission boundary.
+	assertHealthAvailable(t)
+	// The wrong listener exposes no business API, even with a valid token.
+	health.token = world.token
+	response := health.request(t, http.MethodGet, "/api/contacts", "", nil)
+	thenStatus(t, response, http.StatusNotFound)
 
-		// When the clock is one nanosecond short of draining, rejection still
-		// rounds the remaining duration up to one second and changes no state.
-		elapsed.Store(int64(6*time.Second - time.Nanosecond))
-		response = consumers[0].request(t, http.MethodPost, "/api/contacts", "application/json", strings.NewReader(`{"first_name":"Too early"}`))
-		thenStatus(t, response, http.StatusTooManyRequests)
-		if response.header.Get("Retry-After") != "1" {
-			t.Fatalf("Then fractional drain time rounds up: Retry-After=%q", response.header.Get("Retry-After"))
-		}
-		thenBDDCreationsAndAudits(t, world, admitted)
-	})
+	// When the clock is one nanosecond short of draining, rejection still
+	// rounds the remaining duration up to one second and changes no state.
+	elapsed.Store(int64(6*time.Second - time.Nanosecond))
+	response = consumers[0].request(t, http.MethodPost, "/api/contacts", "application/json", strings.NewReader(`{"first_name":"Too early"}`))
+	thenStatus(t, response, http.StatusTooManyRequests)
+	if response.header.Get("Retry-After") != "1" {
+		t.Fatalf("Then fractional drain time rounds up: Retry-After=%q", response.header.Get("Retry-After"))
+	}
+	thenBDDCreationsAndAudits(t, world, admitted)
 
-	t.Run("Given_exactly_six_seconds_When_health_and_another_API_wave_arrive_Then_exactly_one_more_mutation_is_admitted", func(t *testing.T) {
-		elapsed.Store(int64(6 * time.Second))
-		assertHealthAvailable(t)
-		admitted = append(admitted, whenBDDConsumersCreate(t, consumers, "second"))
-		thenBDDCreationsAndAudits(t, world, admitted)
-	})
+	// Given exactly six seconds, When health and another API wave arrive,
+	// Then exactly one more mutation is admitted across all actors.
+	elapsed.Store(int64(6 * time.Second))
+	assertHealthAvailable(t)
+	admitted = append(admitted, whenBDDConsumersCreate(t, consumers, "second"))
+	thenBDDCreationsAndAudits(t, world, admitted)
 }
 
 type bddAdmission struct{ contactID, actor string }

@@ -66,7 +66,7 @@ with cancellation; no unbounded background-copy workaround is introduced.
 | Email | Optional plain parsed address, at most 254 bytes |
 | Contact controls | Rejected |
 | Upload | Exactly one `file` part, at most 100 MiB content; multipart body at most 101 MiB |
-| Filename | Nonempty, at most 255 bytes; no path separators or controls |
+| Filename | Go's multipart parser first takes the platform basename (forward-slash paths on macOS); the resulting name must be nonempty, at most 255 bytes, with no remaining separators or controls. Storage always uses a server-generated UUID. |
 
 Invalid JSON/shape/fields returns `400`, unsupported media `415`, excessive bytes
 `413`. Imports finish validation before mutation. Query limits/date formats are

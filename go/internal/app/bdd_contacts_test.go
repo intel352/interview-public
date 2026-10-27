@@ -115,6 +115,11 @@ func TestBDDContactsCRUD(t *testing.T) {
 		})
 	}
 	thenContactAuditCount(t, world, 3)
+	thenContactAuditEvents(t, world, []contactAuditEvent{
+		{world.actor, "create", "contact", created.ID},
+		{world.actor, "update", "contact", created.ID},
+		{world.actor, "delete", "contact", created.ID},
+	})
 }
 
 func TestBDDContactOptionalFieldsMayBeEmpty(t *testing.T) {
@@ -333,6 +338,13 @@ func TestBDDContactAuditFailuresRollbackEveryMutation(t *testing.T) {
 				t.Fatalf("Then retry must commit once: count=%d, want %d: %v", count, scenario.count, err)
 			}
 			thenContactAuditCount(t, world, 2)
+			if scenario.method == http.MethodPut {
+				read = world.request(t, http.MethodGet, "/api/contacts/"+original.ID, "", nil)
+				thenStatus(t, read, http.StatusOK)
+				if got := thenContactContract(t, read, world.actor); got.FirstName != "Changed" {
+					t.Fatalf("Then recovered update must persist the replacement, got %+v", got)
+				}
+			}
 		})
 	}
 }
@@ -407,9 +419,14 @@ func TestBDDContactReadModifyWriteProjection(t *testing.T) {
 		t.Fatalf("Then projected replacement must preserve all other fields: %+v", result)
 	}
 	thenContactAuditCount(t, world, 2)
+	read = world.request(t, http.MethodGet, path, "", nil)
+	thenStatus(t, read, http.StatusOK)
+	if got := thenContactContract(t, read, world.actor); !reflect.DeepEqual(got, result) {
+		t.Fatalf("Then projected replacement must be persisted, not only echoed: %+v, want %+v", got, result)
+	}
 }
 
-func TestBDDContactCursorContinuesAfterDeletionAndConcurrentInserts(t *testing.T) {
+func TestBDDContactCursorContinuesAfterDeletionAndInterveningInserts(t *testing.T) {
 	// Given an actor's tied-timestamp records ordered c,b,a and a one-item cursor.
 	world := givenBDDApp(t)
 	if _, err := world.store.ImportContacts(t.Context(), world.actor, []store.Contact{{ID: "a"}, {ID: "b"}, {ID: "c"}}); err != nil {

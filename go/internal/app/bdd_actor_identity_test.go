@@ -18,35 +18,35 @@ func TestBDDActorIdentityFlowsToOwnershipAndAudit(t *testing.T) {
 	world := givenBDDApp(t)
 	alice := world.forActor(t, "alice@example.com")
 	bob := world.forActor(t, "bob@example.com")
+	// Both actors are required phases of one shared-store scenario, rather than
+	// independently selectable subtests whose omitted writes alter final counts.
 	for _, consumer := range []*bddWorld{alice, bob} {
-		t.Run(consumer.actor, func(t *testing.T) {
-			// When each actor verifies its credential and creates a contact.
-			response := consumer.request(t, http.MethodPost, "/api/auth/token", "", nil)
-			thenStatus(t, response, http.StatusOK)
-			identity := decodeBDD[map[string]string](t, response)
-			if len(identity) != 2 || identity["user_id"] != consumer.actor || identity["status"] != "authenticated" {
-				t.Fatalf("Then authenticated context identifies this actor without issuing credentials: %v", identity)
-			}
-			response = consumer.request(t, http.MethodPost, "/api/contacts", "application/json", strings.NewReader(`{"first_name":"Owned contact"}`))
-			thenStatus(t, response, http.StatusCreated)
-			contact := decodeBDD[store.Contact](t, response)
-			if contact.ID == "" || contact.OwnerID != consumer.actor {
-				t.Fatalf("Then API ownership comes from authenticated context: %+v", contact)
-			}
-			// Then the same actor is persisted as owner and mutation-audit actor.
-			var owner, actor, action string
-			err := alice.store.DB().QueryRowContext(t.Context(), `
+		// When each actor verifies its credential and creates a contact.
+		response := consumer.request(t, http.MethodPost, "/api/auth/token", "", nil)
+		thenStatus(t, response, http.StatusOK)
+		identity := decodeBDD[map[string]string](t, response)
+		if len(identity) != 2 || identity["user_id"] != consumer.actor || identity["status"] != "authenticated" {
+			t.Fatalf("Then authenticated context identifies this actor without issuing credentials: %v", identity)
+		}
+		response = consumer.request(t, http.MethodPost, "/api/contacts", "application/json", strings.NewReader(`{"first_name":"Owned contact"}`))
+		thenStatus(t, response, http.StatusCreated)
+		contact := decodeBDD[store.Contact](t, response)
+		if contact.ID == "" || contact.OwnerID != consumer.actor {
+			t.Fatalf("Then API ownership comes from authenticated context: %+v", contact)
+		}
+		// Then the same actor is persisted as owner and mutation-audit actor.
+		var owner, actor, action string
+		err := alice.store.DB().QueryRowContext(t.Context(), `
 				SELECT c.owner_id, a.user_id, a.action
 				FROM contacts c JOIN activity_log a ON a.resource_id = c.id
 				WHERE c.id = ?
 			`, contact.ID).Scan(&owner, &actor, &action)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if owner != consumer.actor || actor != consumer.actor || action != "create" {
-				t.Fatalf("Then context reaches both ownership and audit: owner=%q actor=%q action=%q", owner, actor, action)
-			}
-		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if owner != consumer.actor || actor != consumer.actor || action != "create" {
+			t.Fatalf("Then context reaches both ownership and audit: owner=%q actor=%q action=%q", owner, actor, action)
+		}
 	}
 	thenBDDActorStateCounts(t, alice, 2, 2)
 }
@@ -75,6 +75,11 @@ func TestBDDActorsCannotReadMutateOrReassignEachOthersContacts(t *testing.T) {
 				errorBody := decodeBDD[map[string]string](t, response)
 				if len(errorBody) != 1 || errorBody["error"] != "contact not found" {
 					t.Fatalf("Then denied access discloses no contact fields: %s", response.body)
+				}
+				missing := consumer.request(t, method, "/api/contacts/nonexistent-contact", "application/json", strings.NewReader(`{"first_name":"Must not change"}`))
+				thenStatus(t, missing, http.StatusNotFound)
+				if !bytes.Equal(response.body, missing.body) || response.header.Get("Content-Type") != missing.header.Get("Content-Type") || response.header.Get("Cache-Control") != missing.header.Get("Cache-Control") {
+					t.Fatalf("Then foreign and absent resources have the same error contract: foreign=%s absent=%s", response.body, missing.body)
 				}
 			})
 		}
@@ -119,51 +124,57 @@ func TestBDDActorContactCollectionsAndCursorsAreIsolated(t *testing.T) {
 	}
 	var aliceCursor string
 	for _, consumer := range actors {
-		t.Run(consumer.actor+" collection", func(t *testing.T) {
-			// When the actor walks one-record pages, every returned row is its own.
-			path := "/api/contacts?limit=1"
-			seen := make(map[string]bool)
-			for pageIndex := range 3 {
-				response := consumer.request(t, http.MethodGet, path, "", nil)
-				thenStatus(t, response, http.StatusOK)
-				page := decodeBDD[bddContactPage](t, response)
-				if len(page.Contacts) != 1 {
-					t.Fatalf("Then page %d contains exactly one owned record, got %d", pageIndex+1, len(page.Contacts))
-				}
-				contact := page.Contacts[0]
-				if contact.OwnerID != consumer.actor || !strings.HasPrefix(contact.FirstName, consumer.actor+" ") || seen[contact.ID] {
-					t.Fatalf("Then pages neither leak nor duplicate records: %+v", contact)
-				}
-				seen[contact.ID] = true
-				if pageIndex < 2 {
-					if page.NextPageToken == "" {
-						t.Fatal("Then the next owned record has a cursor")
-					}
-					if consumer == alice && pageIndex == 0 {
-						aliceCursor = page.NextPageToken
-					}
-					path = "/api/contacts?limit=1&page_token=" + url.QueryEscape(page.NextPageToken)
-				} else if page.NextPageToken != "" {
-					t.Fatal("Then the cursor stops after the actor's third record")
-				}
-			}
-			// When exporting, then the CSV contains exactly those same owned IDs.
-			response := consumer.request(t, http.MethodGet, "/api/contacts/export", "", nil)
+		// These walks jointly establish the later cross-actor cursor assertion.
+		// When the actor walks one-record pages, every returned row is its own.
+		path := "/api/contacts?limit=1"
+		seen := make(map[string]bool)
+		for pageIndex := range 3 {
+			response := consumer.request(t, http.MethodGet, path, "", nil)
 			thenStatus(t, response, http.StatusOK)
-			rows, err := csv.NewReader(bytes.NewReader(response.body)).ReadAll()
-			if err != nil || len(rows) != 4 {
-				t.Fatalf("Then export is a header plus three owned records: rows=%d error=%v", len(rows), err)
+			page := decodeBDD[bddContactPage](t, response)
+			if len(page.Contacts) != 1 {
+				t.Fatalf("Then page %d contains exactly one owned record, got %d", pageIndex+1, len(page.Contacts))
 			}
-			for _, row := range rows[1:] {
-				if len(row) != 8 || !seen[row[0]] || !strings.HasPrefix(row[1], consumer.actor+" ") {
-					t.Fatalf("Then export exposes only this actor's imported records: %v", row)
+			contact := page.Contacts[0]
+			if contact.OwnerID != consumer.actor || !strings.HasPrefix(contact.FirstName, consumer.actor+" ") || seen[contact.ID] {
+				t.Fatalf("Then pages neither leak nor duplicate records: %+v", contact)
+			}
+			var persistedOwner, persistedName string
+			if err := world.store.DB().QueryRowContext(t.Context(), `SELECT owner_id, first_name FROM contacts WHERE id = ?`, contact.ID).Scan(&persistedOwner, &persistedName); err != nil {
+				t.Fatal(err)
+			}
+			if persistedOwner != consumer.actor || persistedName != contact.FirstName {
+				t.Fatalf("Then list ownership matches persisted imported row: owner=%q name=%q, response=%+v", persistedOwner, persistedName, contact)
+			}
+			seen[contact.ID] = true
+			if pageIndex < 2 {
+				if page.NextPageToken == "" {
+					t.Fatal("Then the next owned record has a cursor")
 				}
-				delete(seen, row[0])
+				if consumer == alice && pageIndex == 0 {
+					aliceCursor = page.NextPageToken
+				}
+				path = "/api/contacts?limit=1&page_token=" + url.QueryEscape(page.NextPageToken)
+			} else if page.NextPageToken != "" {
+				t.Fatal("Then the cursor stops after the actor's third record")
 			}
-			if len(seen) != 0 {
-				t.Fatalf("Then export includes every owned record exactly once: omitted=%v", seen)
+		}
+		// When exporting, then the CSV contains exactly those same owned IDs.
+		response := consumer.request(t, http.MethodGet, "/api/contacts/export", "", nil)
+		thenStatus(t, response, http.StatusOK)
+		rows, err := csv.NewReader(bytes.NewReader(response.body)).ReadAll()
+		if err != nil || len(rows) != 4 {
+			t.Fatalf("Then export is a header plus three owned records: rows=%d error=%v", len(rows), err)
+		}
+		for _, row := range rows[1:] {
+			if len(row) != 8 || !seen[row[0]] || !strings.HasPrefix(row[1], consumer.actor+" ") {
+				t.Fatalf("Then export exposes only this actor's imported records: %v", row)
 			}
-		})
+			delete(seen, row[0])
+		}
+		if len(seen) != 0 {
+			t.Fatalf("Then export includes every owned record exactly once: omitted=%v", seen)
+		}
 	}
 	// When Bob replays Alice's cursor, then it is rejected rather than applying
 	// Alice's paging scope to Bob's collection or exposing Alice's data.
@@ -178,6 +189,12 @@ func TestBDDActorContactCollectionsAndCursorsAreIsolated(t *testing.T) {
 		t.Fatalf("Then a foreign cursor discloses no special ownership information: foreign=%s malformed=%s", response.body, malformed.body)
 	}
 	thenBDDActorStateCounts(t, alice, 6, 4) // Two imports and two export attempts.
+	thenContactAuditEvents(t, world, []contactAuditEvent{
+		{alice.actor, "import", "contacts", ""},
+		{bob.actor, "import", "contacts", ""},
+		{alice.actor, "export", "contacts", ""},
+		{bob.actor, "export", "contacts", ""},
+	})
 }
 
 func TestBDDUnknownActorCredentialIsRejected(t *testing.T) {

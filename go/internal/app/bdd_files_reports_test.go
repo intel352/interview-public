@@ -323,6 +323,33 @@ func TestBDDFilesArePrivateToTheirOwner(t *testing.T) {
 		t.Errorf("Then foreign and absent IDs must not disclose existence: foreign=%s missing=%s", foreign.body, missing.body)
 	}
 
+	// When Bob uploads his own file, both actors still list only their own metadata.
+	bobBody, bobContentType := givenBDDFileBody(t, "bob-only.txt", "text/plain", []byte("Bob's synthetic content"))
+	bobUpload := bob.request(t, http.MethodPost, "/api/files", bobContentType, bobBody)
+	thenStatus(t, bobUpload, http.StatusCreated)
+	bobFile := thenBDDFileSchema(t, bobUpload)
+	bobDownload := bob.request(t, http.MethodGet, "/api/files/"+bobFile.ID, "", nil)
+	thenStatus(t, bobDownload, http.StatusOK)
+	if string(bobDownload.body) != "Bob's synthetic content" || bobFile.OwnerID != bob.actor {
+		t.Fatalf("Then Bob can use his own file: metadata=%+v body=%q", bobFile, bobDownload.body)
+	}
+	for _, scenario := range []struct {
+		consumer   *bddWorld
+		own, other store.File
+	}{{alice, file, bobFile}, {bob, bobFile, file}} {
+		response := scenario.consumer.request(t, http.MethodGet, "/api/files", "", nil)
+		thenStatus(t, response, http.StatusOK)
+		files := decodeBDD[[]store.File](t, response)
+		if len(files) != 1 || files[0] != scenario.own {
+			t.Fatalf("Then each actor lists exactly its own file: actor=%q files=%+v", scenario.consumer.actor, files)
+		}
+		denied := scenario.consumer.request(t, http.MethodGet, "/api/files/"+scenario.other.ID, "", nil)
+		thenStatus(t, denied, http.StatusNotFound)
+		if !bytes.Equal(denied.body, missing.body) {
+			t.Fatalf("Then denial is symmetric and reveals no foreign metadata: %s", denied.body)
+		}
+	}
+
 	// Given the owned blob is then removed, Bob still gets 404 before file access.
 	if err := os.Remove(filepath.Join(alice.store.FilesDir(), file.ID)); err != nil {
 		t.Fatal(err)
@@ -333,8 +360,8 @@ func TestBDDFilesArePrivateToTheirOwner(t *testing.T) {
 		t.Errorf("Then inaccessible blob state must remain private: %s", foreign.body)
 	}
 	var audits int
-	if err := alice.store.DB().QueryRowContext(t.Context(), `SELECT COUNT(*) FROM activity_log WHERE user_id = ?`, bob.actor).Scan(&audits); err != nil || audits != 0 {
-		t.Fatalf("Then denied/missing downloads do not create Bob audit records: count=%d err=%v", audits, err)
+	if err := alice.store.DB().QueryRowContext(t.Context(), `SELECT COUNT(*) FROM activity_log WHERE user_id = ?`, bob.actor).Scan(&audits); err != nil || audits != 2 {
+		t.Fatalf("Then only Bob's successful upload/download create audit records: count=%d err=%v", audits, err)
 	}
 }
 
@@ -360,10 +387,7 @@ func TestBDDFileOwnerCannotBeSuppliedByUpload(t *testing.T) {
 	// When Alice submits that payload, then the extra ownership field is rejected.
 	response := alice.request(t, http.MethodPost, "/api/files", writer.FormDataContentType(), &body)
 	thenStatus(t, response, http.StatusBadRequest)
-	var count int
-	if err := alice.store.DB().QueryRowContext(t.Context(), `SELECT COUNT(*) FROM files`).Scan(&count); err != nil || count != 0 {
-		t.Fatalf("Then rejected ownership input creates no file records: count=%d err=%v", count, err)
-	}
+	thenBDDNoFilesOrAudits(t, alice)
 }
 
 func TestBDDActivityReportsArePrivateToActor(t *testing.T) {

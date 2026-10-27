@@ -9,6 +9,10 @@ A simple CRM-style API server for managing contacts and files. Available in both
 
 Both implementations provide the core CRM routes. Go now has actor-owned data, a separate health listener and stricter validation; its database schema is no longer interchangeable with Java. See [Go hardening](go/HARDENING.md), [API testing](go/API_TESTING.md) and [compatibility review](go/COMPATIBILITY.md). Java is unchanged.
 
+The original prework requested the global leaky bucket. This branch also includes
+later requested work; [scope and rationale](go/SCOPE.md) separates the assignment,
+its supporting tests, and the expanded hardening, ownership and health features.
+
 ## Quick Start
 
 ### Go

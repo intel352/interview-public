@@ -1,10 +1,15 @@
 package app
 
 import (
+	"bytes"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/weave-lab/interview-public/go/internal/store"
 )
 
 // Keep this table in step with NewRouter: every business method/path is protected.
@@ -26,8 +31,19 @@ var businessScenarios = []struct {
 }
 
 func TestBDDProtectedBusinessRoutes(t *testing.T) {
-	// Given a fresh actor workspace and consumers without its startup token.
+	// Given real records created through the API, so denied reads and mutations
+	// exercise existing resources instead of succeeding only on missing IDs.
 	world := givenBDDApp(t)
+	created := world.request(t, http.MethodPost, "/api/contacts", "application/json", strings.NewReader(`{"first_name":"Private contact","email":"private@example.com"}`))
+	thenStatus(t, created, http.StatusCreated)
+	contact := decodeBDD[store.Contact](t, created)
+	fileContent := []byte("Private file content")
+	uploadBody, uploadMedia := givenBDDFileBody(t, "private.txt", "text/plain", fileContent)
+	uploadBytes := bytes.Clone(uploadBody.Bytes())
+	uploaded := world.request(t, http.MethodPost, "/api/files", uploadMedia, uploadBody)
+	thenStatus(t, uploaded, http.StatusCreated)
+	file := decodeBDD[store.File](t, uploaded)
+
 	for _, credential := range []struct{ name, value string }{
 		{"missing token", ""}, {"wrong token", "not-the-startup-token"},
 		{"email is not a credential", "someone@example.com"},
@@ -38,21 +54,44 @@ func TestBDDProtectedBusinessRoutes(t *testing.T) {
 			for _, route := range businessScenarios {
 				t.Run(route.method+" "+route.path, func(t *testing.T) {
 					// When any registered business operation is attempted.
-					response := consumer.request(t, route.method, route.path, route.contentType, strings.NewReader(route.body))
+					path := strings.ReplaceAll(route.path, "/contacts/missing", "/contacts/"+contact.ID)
+					path = strings.ReplaceAll(path, "/files/missing", "/files/"+file.ID)
+					body, media := []byte(route.body), route.contentType
+					if route.method == http.MethodPost && route.path == "/api/files" {
+						body, media = uploadBytes, uploadMedia
+					}
+					response := consumer.request(t, route.method, path, media, bytes.NewReader(body))
 					// Then authentication wins before parsing, storage, or delivery.
 					thenStatus(t, response, http.StatusUnauthorized)
 					if response.header.Get("WWW-Authenticate") != "Bearer" || response.header.Get("Cache-Control") != "no-store" {
 						t.Errorf("Then unauthorized responses must challenge without caching: %v", response.header)
 					}
+					if string(response.body) != "Unauthorized\n" {
+						t.Errorf("Then denial must not expose resource data: %q", response.body)
+					}
 				})
 			}
+			// Malformed input must still be denied before the JSON parser runs.
+			thenStatus(t, consumer.request(t, http.MethodPost, "/api/contacts", "application/json", strings.NewReader("{")), http.StatusUnauthorized)
 		})
 	}
 	// Then unauthorized operations leave both data and audit history untouched.
-	assertEmptyContactsAndAudits(t, world.store)
+	thenBDDActorStateCounts(t, world, 1, 2)
+	persisted, err := world.store.GetContact(t.Context(), world.actor, contact.ID)
+	if err != nil || persisted != contact {
+		t.Fatalf("Then the existing contact remains unchanged: got %+v, error=%v", persisted, err)
+	}
 	files, err := world.store.ListFiles(t.Context(), world.actor)
-	if err != nil || len(files) != 0 {
-		t.Fatalf("Then unauthorized uploads create no files: count=%d error=%v", len(files), err)
+	if err != nil || len(files) != 1 || files[0] != file {
+		t.Fatalf("Then the existing file metadata remains unchanged: files=%v error=%v", files, err)
+	}
+	content, err := os.ReadFile(filepath.Join(world.store.FilesDir(), file.ID))
+	if err != nil || !bytes.Equal(content, fileContent) {
+		t.Fatalf("Then the existing file content remains unchanged: content=%q error=%v", content, err)
+	}
+	entries, err := os.ReadDir(world.store.FilesDir())
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("Then denied uploads leave no extra blobs: entries=%d error=%v", len(entries), err)
 	}
 }
 

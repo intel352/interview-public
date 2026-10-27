@@ -28,7 +28,9 @@ func TestTokenAuthentication(t *testing.T) {
 		{"empty configuration", "", []string{"Bearer "}, 401},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
+			calls := 0
 			h := TokenParser(map[string]string{tt.expected: "alice@example.com"})(RequireAuth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls++
 				if got := UserID(r.Context()); got != "alice@example.com" {
 					t.Errorf("principal = %q, want alice@example.com", got)
 				}
@@ -41,6 +43,16 @@ func TestTokenAuthentication(t *testing.T) {
 			h.ServeHTTP(w, r)
 			if w.Code != tt.status {
 				t.Fatalf("status = %d, want %d", w.Code, tt.status)
+			}
+			wantCalls := 0
+			if tt.status == http.StatusOK {
+				wantCalls = 1
+			}
+			if calls != wantCalls {
+				t.Errorf("downstream calls = %d, want %d", calls, wantCalls)
+			}
+			if w.Header().Get("Cache-Control") != "no-store" {
+				t.Error("authentication response must not be cached")
 			}
 			if tt.status == 401 && w.Header().Get("WWW-Authenticate") != "Bearer" {
 				t.Fatal("missing bearer challenge")
@@ -58,9 +70,14 @@ func TestNewToken(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	decoded, err := base64.RawURLEncoding.DecodeString(first)
-	if err != nil || len(decoded) != 32 || first == second {
-		t.Fatalf("expected distinct tokens containing 32 random bytes; decoded length=%d, error=%v", len(decoded), err)
+	for _, token := range []string{first, second} {
+		decoded, err := base64.RawURLEncoding.DecodeString(token)
+		if err != nil || len(decoded) != 32 {
+			t.Fatalf("expected token containing 32 random bytes; decoded length=%d, error=%v", len(decoded), err)
+		}
+	}
+	if first == second {
+		t.Fatal("two generated credentials must be distinct")
 	}
 }
 
@@ -99,7 +116,7 @@ func TestActorConfiguration(t *testing.T) {
 	seen := map[string]bool{}
 	for token, actor := range credentials {
 		decoded, err := base64.RawURLEncoding.DecodeString(token)
-		if err != nil || len(decoded) != 32 || seen[actor] {
+		if err != nil || len(decoded) != 32 || seen[actor] || (actor != actors[0] && actor != actors[1]) {
 			t.Fatal("expected one independent 256-bit token per actor")
 		}
 		seen[actor] = true

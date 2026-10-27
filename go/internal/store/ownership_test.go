@@ -3,6 +3,7 @@ package store
 import (
 	"database/sql"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -109,6 +110,9 @@ func TestScopedDatabaseReopensWithoutChangingOwners(t *testing.T) {
 	if err := s.CreateContact(t.Context(), "alice", &Contact{ID: "persisted"}); err != nil {
 		t.Fatal(err)
 	}
+	if err := s.CreateFile(t.Context(), "bob", &File{ID: "persisted-file", Filename: "private.txt", ContentType: "text/plain"}, strings.NewReader("Bob's durable bytes")); err != nil {
+		t.Fatal(err)
+	}
 	if err := s.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -128,6 +132,29 @@ func TestScopedDatabaseReopensWithoutChangingOwners(t *testing.T) {
 	if _, err := reopened.GetContact(t.Context(), "bob", "persisted"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("reopened foreign contact=%v", err)
 	}
+	file, metadata, err := reopened.OpenFile(t.Context(), "bob", "persisted-file")
+	if err != nil {
+		t.Fatal(err)
+	}
+	content, readErr := io.ReadAll(file)
+	closeErr := file.Close()
+	if readErr != nil || closeErr != nil || string(content) != "Bob's durable bytes" || metadata.OwnerID != "bob" || metadata.Size != int64(len(content)) {
+		t.Fatalf("reopened file=%q metadata=%+v read=%v close=%v", content, metadata, readErr, closeErr)
+	}
+	if _, err := reopened.GetFile(t.Context(), "alice", "persisted-file"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("reopened foreign file=%v", err)
+	}
+	for _, expected := range []struct{ actor, action, resource, id string }{
+		{"alice", "create", "contact", "persisted"}, {"bob", "upload", "file", "persisted-file"},
+	} {
+		var count int
+		if err := reopened.DB().QueryRowContext(t.Context(), `SELECT COUNT(*) FROM activity_log WHERE user_id=? AND action=? AND resource_type=? AND resource_id=?`, expected.actor, expected.action, expected.resource, expected.id).Scan(&count); err != nil || count != 1 {
+			t.Fatalf("reopened audit %+v count=%d error=%v", expected, count, err)
+		}
+	}
+	if activityCount(t, reopened) != 2 {
+		t.Fatal("reopening inserted or removed audit records")
+	}
 }
 
 func TestActorForeignKeysAndRegistration(t *testing.T) {
@@ -141,6 +168,13 @@ func TestActorForeignKeysAndRegistration(t *testing.T) {
 	if err := s.RegisterActors(ctx, []string{"alice", "alice"}); err != nil {
 		t.Fatal(err)
 	}
+	if err := s.RegisterActors(ctx, []string{"not-partially-registered", "invalid\nactor"}); err == nil {
+		t.Fatal("invalid registration batch accepted")
+	}
+	var registered int
+	if err := s.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM actors WHERE id='not-partially-registered'`).Scan(&registered); err != nil || registered != 0 {
+		t.Fatalf("rejected batch partially registered actors: count=%d error=%v", registered, err)
+	}
 	var foreignKeys int
 	if err := s.DB().QueryRowContext(ctx, "PRAGMA foreign_keys").Scan(&foreignKeys); err != nil || foreignKeys != 1 {
 		t.Fatalf("foreign_keys=%d error=%v", foreignKeys, err)
@@ -149,6 +183,10 @@ func TestActorForeignKeysAndRegistration(t *testing.T) {
 	s.DB().SetMaxIdleConns(0)
 	if err := s.DB().QueryRowContext(ctx, "PRAGMA foreign_keys").Scan(&foreignKeys); err != nil || foreignKeys != 1 {
 		t.Fatalf("replacement foreign_keys=%d error=%v", foreignKeys, err)
+	}
+	var timeout int
+	if err := s.DB().QueryRowContext(ctx, "PRAGMA busy_timeout").Scan(&timeout); err != nil || timeout != 5000 {
+		t.Fatalf("replacement busy_timeout=%d error=%v", timeout, err)
 	}
 	s.DB().SetMaxIdleConns(1)
 	if err := s.CreateContact(ctx, "unregistered", &Contact{ID: "unknown-owner"}); err == nil {
@@ -203,14 +241,51 @@ func TestActorCursorScopeSurvivesDeletedAnchor(t *testing.T) {
 }
 
 func TestLegacySharedDatabaseIsRejectedWithoutSchemaChanges(t *testing.T) {
+	for _, fixture := range []string{"without blob directory", "with legacy blob"} {
+		t.Run(fixture, func(t *testing.T) {
+			testLegacySharedDatabaseIsRejected(t, fixture == "with legacy blob")
+		})
+	}
+}
+
+func testLegacySharedDatabaseIsRejected(t *testing.T, hasBlob bool) {
+	t.Helper()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "app.db")
+	// This fixture is the actual starter schema at d35ce33, not a lookalike
+	// containing only the one column inspected by the migration guard.
+	legacySchema, err := os.ReadFile("testdata/legacy_schema.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec(`CREATE TABLE contacts(id TEXT PRIMARY KEY, first_name TEXT); INSERT INTO contacts VALUES('legacy','Unassigned')`); err != nil {
+	t.Cleanup(func() {
+		if err := db.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	if _, err := db.Exec(string(legacySchema)); err != nil {
 		t.Fatal(err)
+	}
+	if _, err := db.Exec(`
+		INSERT INTO contacts(id,first_name,last_name,email,phone,company) VALUES('legacy','Unassigned','','','','');
+		INSERT INTO activity_log(user_id,action,resource_type,resource_id) VALUES('legacy-actor','create','contact','legacy')`); err != nil {
+		t.Fatal(err)
+	}
+	blobPath := filepath.Join(dir, "files", "legacy-file")
+	if hasBlob {
+		if err := os.Mkdir(filepath.Dir(blobPath), 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(blobPath, []byte("legacy bytes"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Exec(`INSERT INTO files(id,filename,size,content_type) VALUES('legacy-file','old.txt',12,'text/plain')`); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
@@ -231,7 +306,14 @@ func TestLegacySharedDatabaseIsRejectedWithoutSchemaChanges(t *testing.T) {
 	if err != nil || string(after) != string(before) {
 		t.Fatalf("legacy database changed: error=%v", err)
 	}
-	if _, err := os.Stat(filepath.Join(dir, "files")); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("legacy rejection created files directory: %v", err)
+	if hasBlob {
+		content, err := os.ReadFile(blobPath)
+		if err != nil || string(content) != "legacy bytes" {
+			t.Fatalf("legacy rejection changed existing file: bytes=%q error=%v", content, err)
+		}
+	} else {
+		if _, err := os.Stat(filepath.Join(dir, "files")); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("legacy rejection created files directory: %v", err)
+		}
 	}
 }

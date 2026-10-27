@@ -444,25 +444,33 @@ func givenRunningDemo(t *testing.T, data string) (apiURL, healthURL, token strin
 
 func demoRequest(t *testing.T, client *http.Client, method, url, token string, want int) []byte {
 	t.Helper()
-	r, err := http.NewRequestWithContext(t.Context(), method, url, nil)
+	return demoJSONRequest(t, client, method, url, token, nil, want)
+}
+
+func demoJSONRequest(t *testing.T, client *http.Client, method, url, token string, body io.Reader, want int) []byte {
+	t.Helper()
+	r, err := http.NewRequestWithContext(t.Context(), method, url, body)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if token != "" {
 		r.Header.Set("Authorization", "Bearer "+token)
 	}
+	if body != nil {
+		r.Header.Set("Content-Type", "application/json")
+	}
 	response, err := client.Do(r)
 	if err != nil {
 		t.Fatal(err)
 	}
-	body, readErr := io.ReadAll(io.LimitReader(response.Body, 1<<20))
+	responseBody, readErr := io.ReadAll(io.LimitReader(response.Body, 1<<20))
 	if err := errors.Join(readErr, response.Body.Close()); err != nil {
 		t.Fatal(err)
 	}
 	if response.StatusCode != want {
 		t.Fatalf("Then %s %s status = %d, want %d", method, url, response.StatusCode, want)
 	}
-	return body
+	return responseBody
 }
 
 func TestBDDHealthIsIndependentOfAPILimit(t *testing.T) {
@@ -494,28 +502,51 @@ func TestBDDListenersExposeOnlyTheirOwnRoutes(t *testing.T) {
 }
 
 func TestBDDRestartChangesCredentialAndKeepsData(t *testing.T) {
-	// Given one persisted workspace, When the server restarts, Then the old
-	// startup credential fails and the independently generated credential changes.
-	data := givenSeededDirectory(t)
-	_, _, oldToken, stop := givenRunningDemo(t, data)
+	// Given a contact created through the real authenticated startup path,
+	// When the server restarts, Then the new credential can read the same
+	// persisted record, and a credential from the previous run is rejected.
+	data := t.TempDir()
+	apiURL, _, oldToken, stop := givenRunningDemo(t, data)
+	client := &http.Client{Timeout: 3 * time.Second}
+	t.Cleanup(client.CloseIdleConnections)
+	createdBody := demoJSONRequest(t, client, http.MethodPost, apiURL+"/api/contacts", oldToken,
+		strings.NewReader(`{"first_name":"Persisted through restart","email":"alice@example.com"}`), http.StatusCreated)
+	var created store.Contact
+	if err := json.Unmarshal(createdBody, &created); err != nil || created.ID == "" || created.OwnerID != scenarioActor {
+		t.Fatalf("Then create must return the authenticated actor's persisted record: %+v, %v", created, err)
+	}
 	stop()
-	apiURL, healthURL, newToken, _ := givenRunningDemo(t, data)
+	apiURL, healthURL, newToken, stop := givenRunningDemo(t, data)
 	if oldToken == newToken {
 		t.Fatal("Then restart must generate a fresh credential")
 	}
-	client := &http.Client{Timeout: 3 * time.Second}
-	t.Cleanup(client.CloseIdleConnections)
-	demoRequest(t, client, http.MethodGet, apiURL+"/api/contacts", oldToken, http.StatusUnauthorized)
+	body := demoRequest(t, client, http.MethodGet, apiURL+"/api/contacts/"+created.ID, newToken, http.StatusOK)
+	var restored store.Contact
+	if err := json.Unmarshal(body, &restored); err != nil || restored != created {
+		t.Fatalf("Then the new credential must restore access to the exact record: got %+v, want %+v, error %v", restored, created, err)
+	}
 	demoRequest(t, client, http.MethodGet, healthURL+"/health", "", http.StatusOK)
-	// Persistence is checked directly because the rejected API request consumed
-	// its real six-second admission; clock-boundary behavior is tested elsewhere.
+	stop()
+	// A further real restart resets the global allowance without sleeps. Its
+	// first request proves a previously valid token is rejected by auth itself,
+	// rather than merely receiving 429 from an already full limiter.
+	apiURL, _, _, stop = givenRunningDemo(t, data)
+	demoRequest(t, client, http.MethodGet, apiURL+"/api/contacts/"+created.ID, newToken, http.StatusUnauthorized)
+	stop()
+
 	s, err := store.New(data)
 	if err != nil {
 		t.Fatal(err)
 	}
-	count, countErr := s.CountContacts(t.Context(), scenarioActor)
-	if err := errors.Join(countErr, s.Close()); err != nil || count != 1 {
-		t.Fatalf("Then persisted contacts = %d, error = %v; want 1", count, err)
+	stored, readErr := s.GetContact(t.Context(), scenarioActor, created.ID)
+	var createAudits, allAudits int
+	auditErr := s.DB().QueryRowContext(t.Context(), `SELECT COUNT(*) FROM activity_log WHERE user_id=? AND action='create' AND resource_type='contact' AND resource_id=?`, scenarioActor, created.ID).Scan(&createAudits)
+	allAuditErr := s.DB().QueryRowContext(t.Context(), "SELECT COUNT(*) FROM activity_log").Scan(&allAudits)
+	if err := errors.Join(readErr, auditErr, allAuditErr, s.Close()); err != nil {
+		t.Fatal(err)
+	}
+	if stored.ID != created.ID || stored.OwnerID != scenarioActor || stored.FirstName != created.FirstName || createAudits != 1 || allAudits != 1 {
+		t.Fatalf("Then record and its sole creation audit must persist across restarts: stored=%+v, create audits=%d, all audits=%d", stored, createAudits, allAudits)
 	}
 }
 

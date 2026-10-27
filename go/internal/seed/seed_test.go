@@ -3,6 +3,7 @@ package seed
 import (
 	"context"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -140,6 +141,23 @@ func TestBDDSeedDefaultsAndFileOwnership(t *testing.T) {
 		if err != nil || len(files) != 1 || files[0].OwnerID != actor {
 			t.Fatalf("actor %q files = %+v, %v", actor, files, err)
 		}
+		// Metadata alone would pass even if seeding forgot to write the blob.
+		// Read the actual file and check its recorded size and owned upload audit.
+		blob, err := os.Open(filepath.Join(s.FilesDir(), files[0].ID))
+		if err != nil {
+			t.Fatal(err)
+		}
+		info, statErr := blob.Stat()
+		bytesRead, readErr := io.Copy(io.Discard, blob)
+		if err := errors.Join(statErr, readErr, blob.Close()); err != nil {
+			t.Fatal(err)
+		}
+		if !info.Mode().IsRegular() || bytesRead != files[0].Size || info.Size() != files[0].Size || bytesRead == 0 {
+			t.Fatalf("actor %q seed blob differs from metadata: read=%d, size=%d, metadata=%d", actor, bytesRead, info.Size(), files[0].Size)
+		}
+		if got := rowCount(t, s, `SELECT COUNT(*) FROM activity_log WHERE user_id=? AND action='upload' AND resource_type='file' AND resource_id=?`, actor, files[0].ID); got != 1 {
+			t.Fatalf("actor %q file %q has %d upload audits, want 1", actor, files[0].ID, got)
+		}
 		contacts, err := s.ListContacts(t.Context(), actor, 10, nil)
 		if err != nil || len(contacts) != 1 || contacts[0].OwnerID != actor {
 			t.Fatalf("actor %q contacts = %+v, %v", actor, contacts, err)
@@ -179,6 +197,10 @@ func TestBDDInterruptedSeedRollsBackAndCanRetry(t *testing.T) {
 			if err := s.CreateContact(t.Context(), "existing-owner", &store.Contact{ID: "existing", FirstName: "Keep"}); err != nil {
 				t.Fatal(err)
 			}
+			original, err := s.GetContact(t.Context(), "existing-owner", "existing")
+			if err != nil {
+				t.Fatal(err)
+			}
 			preserved := filepath.Join(s.FilesDir(), "unrelated-file")
 			if err := os.WriteFile(preserved, []byte("preserve me"), 0600); err != nil {
 				t.Fatal(err)
@@ -202,6 +224,10 @@ func TestBDDInterruptedSeedRollsBackAndCanRetry(t *testing.T) {
 			// Then no seed rows, actors, marker or partial file survive.
 			if after := seedSnapshot(t, s); !reflect.DeepEqual(after, before) {
 				t.Fatalf("failed seed changed rows: before=%v after=%v", before, after)
+			}
+			retained, err := s.GetContact(t.Context(), "existing-owner", "existing")
+			if err != nil || !reflect.DeepEqual(retained, original) {
+				t.Fatalf("failed seed changed the unrelated contact despite unchanged row counts: got %+v, want %+v, error %v", retained, original, err)
 			}
 			entries, err := os.ReadDir(s.FilesDir())
 			if err != nil || len(entries) != 1 || entries[0].Name() != "unrelated-file" {

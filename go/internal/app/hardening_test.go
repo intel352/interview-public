@@ -23,9 +23,10 @@ type integrationClient struct {
 	client *http.Client
 	url    string
 	token  string
+	actor  string
 }
 
-func newIntegrationServer(t *testing.T) (*store.Store, integrationClient) {
+func newIntegrationServer(t *testing.T, wrappers ...func(http.Handler) http.Handler) (*store.Store, map[string]integrationClient) {
 	t.Helper()
 	s, err := store.New(t.TempDir())
 	if err != nil {
@@ -36,19 +37,29 @@ func newIntegrationServer(t *testing.T) (*store.Store, integrationClient) {
 			t.Errorf("close store: %v", err)
 		}
 	})
-	if err := s.RegisterActors(t.Context(), []string{"alice@example.com"}); err != nil {
+	actors := []string{"alice@example.com", "bob@example.com"}
+	if err := s.RegisterActors(t.Context(), actors); err != nil {
 		t.Fatal(err)
 	}
-	token, err := auth.NewToken()
+	credentials, err := auth.NewCredentials(actors)
 	if err != nil {
 		t.Fatal(err)
 	}
 	// Leave out RateLimit: these tests must exercise overlapping handlers.
-	server := httptest.NewServer(NewRouter(s, Options{AuthTokens: map[string]string{token: "alice@example.com"}}))
+	handler := NewRouter(s, Options{AuthTokens: credentials})
+	for _, wrap := range wrappers {
+		handler = wrap(handler)
+	}
+	server := httptest.NewServer(handler)
 	t.Cleanup(server.Close)
 	client := server.Client()
 	client.Timeout = 10 * time.Second
-	return s, integrationClient{client: client, url: server.URL, token: token}
+	t.Cleanup(client.CloseIdleConnections)
+	clients := make(map[string]integrationClient, len(credentials))
+	for token, actor := range credentials {
+		clients[actor] = integrationClient{client: client, url: server.URL, token: token, actor: actor}
+	}
+	return s, clients
 }
 
 func (c integrationClient) request(ctx context.Context, method, path, contentType string, body io.Reader, want int) ([]byte, error) {
@@ -80,16 +91,18 @@ func (c integrationClient) request(ctx context.Context, method, path, contentTyp
 }
 
 func TestConcurrentHTTPMutationsAndAudits(t *testing.T) {
-	s, client := newIntegrationServer(t)
+	s, actorClients := newIntegrationServer(t)
 	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 	defer cancel()
 	const clients = 12
+	actors := []string{"alice@example.com", "bob@example.com"}
 	start := make(chan struct{})
 	failures := make(chan error, clients)
 	var wg sync.WaitGroup
 	for i := range clients {
 		wg.Go(func() {
 			<-start
+			client := actorClients[actors[i%len(actors)]]
 			if err := runContactAndFileWorkflow(ctx, client, i); err != nil {
 				failures <- fmt.Errorf("client %d: %w", i, err)
 			}
@@ -104,22 +117,62 @@ func TestConcurrentHTTPMutationsAndAudits(t *testing.T) {
 	if t.Failed() {
 		return
 	}
-	count, err := s.CountContacts(ctx, "alice@example.com")
-	if err != nil || count != 2*clients {
-		t.Fatalf("contacts=%d, error=%v; want %d", count, err, 2*clients)
+	for _, actor := range actors {
+		count, err := s.CountContacts(ctx, actor)
+		if err != nil || count != clients {
+			t.Fatalf("actor %s contacts=%d, error=%v; want %d", actor, count, err, clients)
+		}
+		files, err := s.ListFiles(ctx, actor)
+		if err != nil || len(files) != clients/len(actors) {
+			t.Fatalf("actor %s files=%d, error=%v; want %d", actor, len(files), err, clients/len(actors))
+		}
+		for _, file := range files {
+			if file.OwnerID != actor {
+				t.Errorf("actor %s listed foreign file owned by %s", actor, file.OwnerID)
+			}
+		}
+		for _, action := range []string{"create", "update", "import", "upload", "download", "delete"} {
+			var count int
+			if err := s.DB().QueryRowContext(ctx, "SELECT COUNT(*) FROM activity_log WHERE action = ? AND user_id = ?", action, actor).Scan(&count); err != nil {
+				t.Fatal(err)
+			}
+			if count != clients/len(actors) {
+				t.Errorf("actor %s audit action %s: got %d, want %d", actor, action, count, clients/len(actors))
+			}
+		}
 	}
-	files, err := s.ListFiles(ctx, "alice@example.com")
-	if err != nil || len(files) != clients {
-		t.Fatalf("files=%d, error=%v; want %d", len(files), err, clients)
+	// Compare persisted values to each consumer's submitted data, independently
+	// of the scoped read helper; counts alone can hide misplaced or lost writes.
+	expected := make(map[string]string, 2*clients)
+	for i := range clients {
+		for _, suffix := range []string{"A", "B"} {
+			expected[fmt.Sprintf("Imported%d%s", i, suffix)] = actors[i%len(actors)]
+		}
 	}
-	for _, action := range []string{"create", "update", "import", "upload", "download", "delete"} {
-		var count int
-		if err := s.DB().QueryRowContext(ctx, "SELECT COUNT(*) FROM activity_log WHERE action = ? AND user_id = ?", action, "alice@example.com").Scan(&count); err != nil {
+	rows, err := s.DB().QueryContext(ctx, "SELECT first_name, owner_id FROM contacts")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := rows.Close(); err != nil {
+			t.Error(err)
+		}
+	}()
+	for rows.Next() {
+		var name, owner string
+		if err := rows.Scan(&name, &owner); err != nil {
 			t.Fatal(err)
 		}
-		if count != clients {
-			t.Errorf("audit action %s: got %d, want %d", action, count, clients)
+		if expected[name] != owner {
+			t.Errorf("persisted contact %q belongs to %q; want %q", name, owner, expected[name])
 		}
+		delete(expected, name)
+	}
+	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+		t.Fatal(err)
+	}
+	if len(expected) != 0 {
+		t.Errorf("missing submitted contacts: %v", expected)
 	}
 	var audits int
 	if err := s.DB().QueryRowContext(ctx, "SELECT COUNT(*) FROM activity_log").Scan(&audits); err != nil {
@@ -140,8 +193,8 @@ func runContactAndFileWorkflow(ctx context.Context, client integrationClient, in
 	if err := json.Unmarshal(data, &contact); err != nil {
 		return err
 	}
-	if contact.ID == "" {
-		return errors.New("created contact has no ID")
+	if contact.ID == "" || contact.OwnerID != client.actor {
+		return errors.New("created contact must have an ID and the authenticated owner")
 	}
 	path := "/api/contacts/" + contact.ID
 	updated := fmt.Sprintf(`{"first_name":"Updated%d","email":"client%d@example.com"}`, index, index)
@@ -191,7 +244,7 @@ func runContactAndFileWorkflow(ctx context.Context, client integrationClient, in
 	if err := json.Unmarshal(data, &file); err != nil {
 		return err
 	}
-	if file.ID == "" || file.Size != int64(len(content)) {
+	if file.ID == "" || file.OwnerID != client.actor || file.Size != int64(len(content)) {
 		return fmt.Errorf("invalid uploaded file metadata: %+v", file)
 	}
 	data, err = client.request(ctx, http.MethodGet, "/api/files/"+file.ID, "", nil, http.StatusOK)
@@ -209,7 +262,8 @@ func runContactAndFileWorkflow(ctx context.Context, client integrationClient, in
 }
 
 func TestHTTPInvalidContactBodiesDoNotMutate(t *testing.T) {
-	s, client := newIntegrationServer(t)
+	s, clients := newIntegrationServer(t)
+	client := clients["alice@example.com"]
 	for _, tt := range []struct {
 		name, body, contentType string
 		status                  int
@@ -231,19 +285,76 @@ func TestHTTPInvalidContactBodiesDoNotMutate(t *testing.T) {
 	assertEmptyContactsAndAudits(t, s)
 }
 
-func TestCanceledMutationDoesNotPersist(t *testing.T) {
-	s, _ := newIntegrationServer(t)
-	ctx, cancel := context.WithCancel(t.Context())
-	cancel()
-	contact := store.Contact{ID: "canceled-contact", FirstName: "Canceled"}
-	if err := s.CreateContact(ctx, "alice@example.com", &contact); !errors.Is(err, context.Canceled) {
-		t.Fatalf("canceled create error=%v, want context.Canceled", err)
+func TestHTTPCanceledMutationDoesNotPersist(t *testing.T) {
+	// Hold SQLite's sole connection so an actual authenticated HTTP mutation
+	// must wait. A canceled client alone is insufficient evidence: observe the
+	// queued database request and the server handler's completion before checking.
+	handled := make(chan struct{})
+	s, clients := newIntegrationServer(t, func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			defer close(handled)
+			next.ServeHTTP(w, r)
+		})
+	})
+	connection, err := s.DB().Conn(t.Context())
+	if err != nil {
+		t.Fatal(err)
 	}
+	defer func() {
+		if connection != nil {
+			if err := connection.Close(); err != nil {
+				t.Error(err)
+			}
+		}
+	}()
+	waitsBefore := s.DB().Stats().WaitCount
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	result := make(chan error, 1)
+	go func() {
+		_, err := clients["alice@example.com"].request(ctx, http.MethodPost, "/api/contacts", "application/json", strings.NewReader(`{"first_name":"Canceled"}`), http.StatusCreated)
+		result <- err
+	}()
+
+	// Poll the pool's observed queue condition, not a guessed amount of time
+	// required for the request to arrive. The timer only bounds a broken test.
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	deadline := time.NewTimer(5 * time.Second)
+	defer deadline.Stop()
+	for s.DB().Stats().WaitCount == waitsBefore {
+		select {
+		case <-ticker.C:
+		case err := <-result:
+			t.Fatalf("request finished before waiting for SQLite: %v", err)
+		case <-deadline.C:
+			t.Fatal("HTTP mutation never entered the SQLite connection queue")
+		}
+	}
+	cancel()
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("canceled HTTP request error=%v, want context.Canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("canceled HTTP request did not return")
+	}
+	select {
+	case <-handled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("server handler did not finish while SQLite was still unavailable")
+	}
+	if err := connection.Close(); err != nil {
+		t.Fatal(err)
+	}
+	connection = nil
 	assertEmptyContactsAndAudits(t, s)
 }
 
 func TestHTTPAuditFailureRollsBackContact(t *testing.T) {
-	s, client := newIntegrationServer(t)
+	s, clients := newIntegrationServer(t)
+	client := clients["alice@example.com"]
 	if _, err := s.DB().ExecContext(t.Context(), "DROP TABLE activity_log"); err != nil {
 		t.Fatal(err)
 	}
