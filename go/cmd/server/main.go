@@ -1,12 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"math/big"
 	"net"
 	"net/http"
@@ -44,7 +46,10 @@ func mainExit() int {
 
 func run(ctx context.Context, args []string, output io.Writer) (result error) {
 	flags := flag.NewFlagSet("server", flag.ContinueOnError)
-	flags.SetOutput(output)
+	// Flag parsing prints diagnostics before returning its error. Buffer that
+	// output so main reports failures once on stderr; only help goes to stdout.
+	var flagOutput bytes.Buffer
+	flags.SetOutput(&flagOutput)
 	addr := flags.String("addr", "127.0.0.1:8080", "numeric loopback listen address")
 	healthAddr := flags.String("health-addr", "", "health loopback address (default API port + 1; API port 0 uses a separate ephemeral port)")
 	actorList := flags.String("actors", auth.DefaultActors, "comma-separated local actor identifiers")
@@ -53,21 +58,37 @@ func run(ctx context.Context, args []string, output io.Writer) (result error) {
 	contacts := flags.Int("contacts", 10000, "number of contacts to seed")
 	files := flags.Int("files", 20, "number of files to seed")
 	rateDefaults := app.DefaultRateLimitConfig()
-	rateRequests := flags.Int64("rate-limit-requests", rateDefaults.Requests, "requests drained per rate-limit-period (shared by all business clients)")
+	rateRequests := rateDefaults.Requests
+	flags.Func("rate-limit-requests", fmt.Sprintf("requests drained per rate-limit-period (shared by all business clients; default %d)", rateDefaults.Requests), func(value string) error {
+		var err error
+		rateRequests, err = parseRateLimitInteger(value)
+		return err
+	})
 	ratePeriod := rateDefaults.Period
 	flags.Func("rate-limit-period", fmt.Sprintf("duration over which rate-limit-requests drain; exact nanoseconds, not a resetting window (default %s)", rateDefaults.Period), func(value string) error {
 		var err error
 		ratePeriod, err = parseRateLimitPeriod(value)
 		return err
 	})
-	rateCapacity := flags.Int64("rate-limit-capacity", rateDefaults.Capacity, "maximum business-request burst when the bucket is empty")
-	if err := flags.Parse(args); err != nil {
+	rateCapacity := rateDefaults.Capacity
+	flags.Func("rate-limit-capacity", fmt.Sprintf("maximum business-request burst when the bucket is empty (default %d)", rateDefaults.Capacity), func(value string) error {
+		var err error
+		rateCapacity, err = parseRateLimitInteger(value)
 		return err
+	})
+	if err := flags.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			if _, writeErr := io.Copy(output, &flagOutput); writeErr != nil {
+				return fmt.Errorf("write help: %w", writeErr)
+			}
+			return err
+		}
+		return fmt.Errorf("%w; run with --help for usage", err)
 	}
 	if flags.NArg() != 0 || *contacts < 0 || *files < 0 {
 		return errors.New("unexpected arguments or negative seed counts")
 	}
-	rateConfig := app.RateLimitConfig{Requests: *rateRequests, Period: ratePeriod, Capacity: *rateCapacity}
+	rateConfig := app.RateLimitConfig{Requests: rateRequests, Period: ratePeriod, Capacity: rateCapacity}
 	if err := rateConfig.Validate(); err != nil {
 		return fmt.Errorf("rate limit: %w", err)
 	}
@@ -144,13 +165,22 @@ func run(ctx context.Context, args []string, output io.Writer) (result error) {
 
 var ratePeriodComponents = regexp.MustCompile(`([0-9]+(?:\.[0-9]*)?|\.[0-9]+)(ns|us|µs|μs|ms|s|m|h)`)
 
+func parseRateLimitInteger(value string) (int64, error) {
+	// Base zero preserves the integer syntax previously accepted by flag.Int64.
+	parsed, err := strconv.ParseInt(value, 0, 64)
+	if err != nil {
+		return 0, fmt.Errorf("must be a whole integer between 1 and %d", int64(math.MaxInt64))
+	}
+	return parsed, nil // Config validation reports all nonpositive fields together.
+}
+
 // parseRateLimitPeriod preserves Go duration syntax but rejects fractional
 // nanoseconds that time.ParseDuration would silently discard. Exact decimal
 // arithmetic also catches truncation within composite values such as 0.5ns0.5ns.
 func parseRateLimitPeriod(value string) (time.Duration, error) {
 	parsed, err := time.ParseDuration(value)
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("%w; use a positive duration such as 1s or 1m, at most %s (%dns)", err, time.Duration(math.MaxInt64), int64(math.MaxInt64))
 	}
 	units := map[string]int64{
 		"ns": 1, "us": 1000, "µs": 1000, "μs": 1000, "ms": 1000000,
@@ -168,7 +198,7 @@ func parseRateLimitPeriod(value string) (time.Duration, error) {
 		total.Neg(total)
 	}
 	if total.Cmp(new(big.Rat).SetInt64(int64(parsed))) != 0 {
-		return 0, errors.New("rate-limit-period must be exactly representable in whole nanoseconds without truncation")
+		return 0, errors.New("rate-limit-period must be exactly representable in whole nanoseconds without truncation; use an exact duration such as 1ns or 1.5s")
 	}
 	return parsed, nil
 }

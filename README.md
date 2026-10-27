@@ -126,6 +126,13 @@ one request per nanosecond and configurations whose
 Zero, negative, malformed and overflowing values never silently use defaults.
 There are no limiter environment variables, config files or hot reload.
 
+Invalid configuration exits with status `1`, writes the reason once to stderr,
+and leaves stdout empty. Diagnostics identify offending flags/values, supported
+bounds and corrective choices. Multiple invalid basic values are reported together;
+relationship checks run after those values are valid.
+Malformed flag syntax stops at its first parsing error and points to `--help`.
+`--help` (or `-h`) prints usage to stdout and exits `0` without opening resources.
+
 Assumptions and behavior:
 
 - **Default capacity: one request.** The first request passes immediately. Another

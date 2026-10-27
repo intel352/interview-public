@@ -2,6 +2,7 @@ package app
 
 import (
 	"errors"
+	"fmt"
 	"log"
 	"math"
 	"net/http"
@@ -24,16 +25,29 @@ func DefaultRateLimitConfig() RateLimitConfig {
 }
 
 func (c RateLimitConfig) Validate() error {
-	if c.Requests <= 0 || c.Period <= 0 || c.Capacity <= 0 {
-		return errors.New("rate limit requests, period and capacity must be positive")
+	var problems []error
+	if c.Requests <= 0 {
+		problems = append(problems, fmt.Errorf("--rate-limit-requests=%d: must be between 1 and %d", c.Requests, int64(math.MaxInt64)))
 	}
+	if c.Period <= 0 {
+		problems = append(problems, fmt.Errorf("--rate-limit-period=%s: must be between 1ns and %s (%dns)", c.Period, time.Duration(math.MaxInt64), int64(math.MaxInt64)))
+	}
+	if c.Capacity <= 0 {
+		problems = append(problems, fmt.Errorf("--rate-limit-capacity=%d: must be between 1 and %d", c.Capacity, int64(math.MaxInt64)))
+	}
+	if len(problems) > 0 {
+		return errors.Join(problems...)
+	}
+	// Check relationships only after positivity, so even invalid configurations
+	// can be explained without division by zero or overflowing arithmetic.
 	if c.Requests > int64(c.Period) {
-		return errors.New("rate limit must allow at least one nanosecond per request")
+		problems = append(problems, fmt.Errorf("--rate-limit-requests=%d exceeds maximum %d for --rate-limit-period=%s: reduce requests or increase period (minimum interval 1ns)", c.Requests, int64(c.Period), c.Period))
 	}
-	if c.Capacity > math.MaxInt64/int64(c.Period) {
-		return errors.New("rate limit capacity times period exceeds integer work precision")
+	maxCapacity := math.MaxInt64 / int64(c.Period)
+	if c.Capacity > maxCapacity {
+		problems = append(problems, fmt.Errorf("--rate-limit-capacity=%d exceeds maximum %d for --rate-limit-period=%s (%dns): reduce capacity or period so capacity × period-in-nanoseconds is at most %d", c.Capacity, maxCapacity, c.Period, int64(c.Period), int64(math.MaxInt64)))
 	}
-	return nil
+	return errors.Join(problems...)
 }
 
 // RateLimit applies one shared leaky bucket to next. Overflow is rejected instead

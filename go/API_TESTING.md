@@ -49,9 +49,11 @@ The suite deliberately uses several test layers:
   timestamps make ordering and date boundaries repeatable; separate workflows
   prove API writes reach the report and ownership tables.
 - Server tests exercise `run` with actual listeners and storage, or `serve` with
-  controlled handlers to isolate lifecycle behavior. They do not launch a child
-  process or exercise OS signal delivery. Shutdown joins the server loops;
-  arbitrary handlers still need to cooperate with cancellation.
+  controlled handlers to isolate lifecycle behavior. CLI tests also launch the
+  ordinary Go test binary as a child process that calls the actual `main`, proving
+  exit codes, stdout/stderr routing, help and successful seeding without a custom
+  application build. They do not exercise OS signal delivery. Shutdown joins the
+  server loops; arbitrary handlers still need to cooperate with cancellation.
 - Root `api_test.go` contains benchmarks, not ordinary correctness tests. They
   check HTTP status and body I/O but do not validate every response field or run
   during `go test ./...`. Mutation benchmarks grow disposable data as they run;
@@ -86,6 +88,7 @@ outcome. Deeper existing unit/fault tests remain alongside the BDD layer.
 | Configured global limiter | Twelve HTTP clients share a three-request burst, fractional refill admits one slot, long idle restores only capacity; exact persisted owners/audits and no rejected writes | `TestBDDConfiguredGlobalRateLimitAcrossHTTPConsumers` |
 | Limiter detail | Default ten/minute, varied rates/periods/capacities, burst/refill, fractional drain and retry ceiling, idle/backward clock, busy downstream handler, interrupted rejection | `TestRateLimit*` tests |
 | Limiter configuration | Constructor bounds and overflow; exact period parsing; invalid CLI settings fail before data/listeners/credentials; real server flags govern shared actors' admissions, persisted writes and health exemption | `TestRateLimitConfigurationValidation`, `TestRateLimitMaximumDurationRetryDoesNotOverflow`, `TestRateLimitPeriodParsing`, `TestBDDRateLimitConfigurationFailsBeforeOpeningData`, `TestBDDConfiguredRateLimitGovernsActualServer` |
+| CLI diagnostics and exit behavior | Actual child-process entry point: actionable flag/value/bound errors, multiple semantic errors, stderr-only failures without duplicate usage, exit 1/no data; help stdout/exit 0, successful seed at supported extremes; failed help output propagates | `TestCLIInvalidConfigurationDiagnostics`, `TestCLIHelpAndSeedSuccessStreams`, `TestRateLimitValidationExplainsInvalidValues`, `TestRateLimitValidationReportsIndependentProblems`, `TestRateLimitValidationAcceptsAdvertisedBounds`, `TestHelpOutputFailureIsReportedWithoutOpeningResources` |
 | Separate `GET /health` | Public liveness only; no API routes on health, no health handler on API; health bypasses full API bucket | `TestBDDHealthListenerIsolation`, `TestBDDHealthIsIndependentOfAPILimit`, `TestBDDListenersExposeOnlyTheirOwnRoutes` |
 | Listener configuration | API port + 1, override, IPv4/IPv6, zero/overflow/collision, partial bind cleanup, no early credential output | `TestBDDListenerAddressSelection`, `TestBDDBindFailureClosesOtherListener`, `TestBDDEphemeralListenersAreSeparate` |
 | Dual lifecycle | Graceful and forced shutdown, either listener fails, active peer cancellation, output failure closes both listeners | `TestBDDServersDrainTogether`, `TestBDDServersForceCloseTogether`, `TestBDDServerFailureCancelsActivePeerAfterGrace`, `TestBDDStartupOutputFailureReleasesBothPorts` |

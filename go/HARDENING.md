@@ -51,10 +51,12 @@ It limits admissions, not concurrent in-flight handlers or fairness. See the
 Both servers set 5-second header, 30-second read/write/request and 60-second idle
 deadlines, with a 16 KiB header limit. The write budget includes body reading.
 These fixed local-demo limits can reject legitimate slow transfers. Both listeners
-stop together on cancellation or server failure. Active handlers get five seconds
-to finish; expiration cancels requests and forcibly closes connections. Server
-loops are joined before shared storage closes. Handlers/readers must cooperate
-with cancellation; no unbounded background-copy workaround is introduced.
+stop together on cancellation or server failure. Cancellation allows active
+handlers up to five seconds to finish; expiration cancels requests and forcibly
+closes connections. A server whose serving loop fails closes its own connections
+immediately; its peer follows the graceful cancellation path. Server loops are
+joined before shared storage closes. Handlers/readers must cooperate with
+cancellation; no unbounded background-copy workaround is introduced.
 
 ## Input and response rules
 
