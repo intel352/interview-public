@@ -26,8 +26,9 @@ closing/removing data. Tests never call an external endpoint. Business workflow
 tests use the real router without the limiter so operations can run promptly.
 Dedicated tests wrap that router in the actual global limiter with a synchronized
 injected clock. CLI/server scenarios exercise actual listeners and production
-wiring, including the separate health listener and shutdown. Clock injection is
-not exposed as a production API.
+wiring, including configurable limiting, the separate health listener and
+shutdown. Clock injection is not exposed as a production API. Rate, period and
+capacity use startup flags; see [configuration semantics](../README.md#request-limiting-go).
 
 The suite deliberately uses several test layers:
 
@@ -82,7 +83,9 @@ outcome. Deeper existing unit/fault tests remain alongside the BDD layer.
 | `GET /api/reports/activity` | Real authenticated HTTP operations → exact persisted audit tuples → actor-only aggregation; UTC default 30 days, inclusive date, empty result, invalid date, current view excluded from its own snapshot | `TestBDDActivityReportsReflectAuthenticatedHTTPWorkflows`, `TestBDDActivityReportIncludesSinceBoundary`, `TestBDDActivityReportDefaultAndEmptyWindows`, `TestBDDActivityReportsArePrivateToActor`, `TestReportSinceUsesUTCForDefaultCutoff` |
 | Routing/error contracts | Unknown route, unsupported method, JSON error envelope for handler input failures | `TestBDDBusinessRoutingAndErrorContract` |
 | Global limiter | Twelve independent Alice/Bob HTTP clients share one admission, rejected writes absent, real ownership/audit of winner, exact six-second boundary | `TestBDDGlobalRateLimitAcrossHTTPConsumers` |
-| Limiter detail | Ten/minute, fractional retry ceiling, idle/backward clock, busy downstream handler, interrupted rejection | Existing `TestRateLimit*` tests |
+| Configured global limiter | Twelve HTTP clients share a three-request burst, fractional refill admits one slot, long idle restores only capacity; exact persisted owners/audits and no rejected writes | `TestBDDConfiguredGlobalRateLimitAcrossHTTPConsumers` |
+| Limiter detail | Default ten/minute, varied rates/periods/capacities, burst/refill, fractional drain and retry ceiling, idle/backward clock, busy downstream handler, interrupted rejection | `TestRateLimit*` tests |
+| Limiter configuration | Constructor bounds and overflow; exact period parsing; invalid CLI settings fail before data/listeners/credentials; real server flags govern shared actors' admissions, persisted writes and health exemption | `TestRateLimitConfigurationValidation`, `TestRateLimitMaximumDurationRetryDoesNotOverflow`, `TestRateLimitPeriodParsing`, `TestBDDRateLimitConfigurationFailsBeforeOpeningData`, `TestBDDConfiguredRateLimitGovernsActualServer` |
 | Separate `GET /health` | Public liveness only; no API routes on health, no health handler on API; health bypasses full API bucket | `TestBDDHealthListenerIsolation`, `TestBDDHealthIsIndependentOfAPILimit`, `TestBDDListenersExposeOnlyTheirOwnRoutes` |
 | Listener configuration | API port + 1, override, IPv4/IPv6, zero/overflow/collision, partial bind cleanup, no early credential output | `TestBDDListenerAddressSelection`, `TestBDDBindFailureClosesOtherListener`, `TestBDDEphemeralListenersAreSeparate` |
 | Dual lifecycle | Graceful and forced shutdown, either listener fails, active peer cancellation, output failure closes both listeners | `TestBDDServersDrainTogether`, `TestBDDServersForceCloseTogether`, `TestBDDServerFailureCancelsActivePeerAfterGrace`, `TestBDDStartupOutputFailureReleasesBothPorts` |
@@ -109,7 +112,7 @@ curl http://127.0.0.1:8081/health
 curl -i -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/api/auth/token -X POST
 ```
 
-Health can be called freely. API calls share the six-second admission interval,
+Health can be called freely. With defaults, API calls share the six-second admission interval,
 including negative authentication attempts. Wait six seconds between the
 following examples, or honor `Retry-After`:
 

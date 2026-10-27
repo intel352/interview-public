@@ -41,9 +41,12 @@ a partial bind is closed.
 The health listener exposes only public `GET /health`, returning process liveness
 without database details. It has no business handlers and never uses the API
 limiter. The API listener has no health handler. One global leaky bucket on the
-API listener admits one request per six seconds across all actors and outcomes;
-rejected requests return non-cacheable JSON `429` and rounded-up `Retry-After`.
-It limits admission spacing, not concurrent in-flight handlers or fairness.
+API listener defaults to one request per six seconds across all actors and
+outcomes. Count, period and capacity are startup flags; larger capacity permits
+bursts. Invalid settings fail before resources open. Rejected requests return
+non-cacheable JSON `429` and rounded-up `Retry-After` until one more request fits.
+It limits admissions, not concurrent in-flight handlers or fairness. See the
+[configuration contract](../README.md#request-limiting-go) for precision and bounds.
 
 Both servers set 5-second header, 30-second read/write/request and 60-second idle
 deadlines, with a 16 KiB header limit. The write budget includes body reading.

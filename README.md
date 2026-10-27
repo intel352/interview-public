@@ -93,34 +93,66 @@ for example `Authorization: Bearer user@example.com`.
 
 The Go server applies one **process-local leaky bucket** shared by every client
 on the business listener, including unauthenticated, unknown-route and failed requests. The separate health listener bypasses this limiter.
-It admits at most **10 requests per minute** by draining one request every six
-seconds. The Java implementation is unchanged.
+The defaults remain **10 requests per minute, capacity one**: one admission every
+six seconds. The Java implementation is unchanged.
+
+Runtime settings (command-line flags only; restart to change them):
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--rate-limit-requests` | `10` | Positive whole requests drained per period |
+| `--rate-limit-period` | `1m` | Positive Go duration, such as `1s`, `500ms` or `2m` |
+| `--rate-limit-capacity` | `1` | Positive whole requests the bucket can hold; maximum immediate burst when empty |
+
+For example, from `go/`:
+
+```bash
+go run ./cmd/server --rate-limit-requests=3 --rate-limit-period=1s --rate-limit-capacity=2
+```
+
+This allows two immediate admissions when empty, then drains at three requests
+per second. The interval is derived from period/count, not a separate setting.
+Fractional intervals such as one third of a second retain their rational drain
+rate; admission is evaluated at nanosecond clock resolution. Capacity greater
+than one permits bursts, so the configured count is not a strict request ceiling
+for each fixed or rolling period.
+
+Invalid explicit settings fail startup before opening data/listeners or printing
+credentials. Count/capacity must fit signed 64-bit integers; the period must fit a Go
+duration. Period text that would lose fractional nanoseconds (such as `1.5ns`)
+is rejected; exact fractional durations such as `1.5s` work. Rates faster than
+one request per nanosecond and configurations whose
+`capacity × period-in-nanoseconds` exceeds `9223372036854775807` are rejected.
+Zero, negative, malformed and overflowing values never silently use defaults.
+There are no limiter environment variables, config files or hot reload.
 
 Assumptions and behavior:
 
-- **Capacity: one request.** The first request passes immediately. Another can
-  pass exactly six seconds later. Idle time does not accumulate burst capacity.
+- **Default capacity: one request.** The first request passes immediately. Another
+  can pass exactly six seconds later. With larger capacity, idle time can empty
+  the bucket but never allow more than the configured capacity in an immediate burst.
 - **Overflow: reject immediately.** A full bucket returns `429 Too Many Requests`,
   `Content-Type: application/json`, and `{"error":"rate limit exceeded"}`. No
   requests are queued or delayed. This is leaky-bucket policing, not a queued
   traffic shaper.
-- `Retry-After` is the remaining drain time rounded up to whole seconds. It is
+- `Retry-After` is the time until one more request fits, rounded up to whole seconds. It is
   advisory: another client may take the next available slot. Rejected requests
   add no work and do not postpone the next admission.
 - Limiting runs before routing and authentication, so `429` takes precedence
   while the bucket is full. Health probes on the separate health listener remain available and never consume the API allowance.
 
-The bucket stores pending work as a duration. Each admitted request adds six
-seconds; elapsed time drains it down to zero. A mutex makes draining and admission
-atomic across clients. The clock is read under that lock, and handlers execute
-after it is released. Production uses Go's monotonic clock through `time.Now`;
-tests inject time so boundaries do not need sleeps. No background worker or new
-dependency is needed.
+The bucket stores scaled integer work: an admission adds `period-in-nanoseconds`
+units, and each elapsed nanosecond drains `requests` units, down to zero. This
+avoids floating-point error and rounding each interval. A mutex makes draining
+and admission atomic across clients. The clock is read under that lock, and
+handlers execute after it is released. Production uses Go's monotonic clock
+through `time.Now`; tests inject time so boundaries do not need sleeps. No
+background worker or new dependency is needed.
 
 This limits admissions, not simultaneous in-flight work: slow handlers can
 overlap. There is no per-client fairness, state resets on restart, and separate
-server processes have independent limits. A larger burst capacity would change
-the strict spacing policy; per-client or distributed limits would require a
+server processes have independent limits. A larger burst capacity changes
+the default strict spacing policy; per-client or distributed limits would require a
 different state scope. The server creates the wrapper once in `cmd/server`;
 `NewRouter` remains reusable without limiting so the existing benchmarks continue
 to measure CRM handlers.
@@ -133,8 +165,10 @@ go test -race ./...
 go vet ./...
 ```
 
-Coverage includes exact six-second boundaries, fractional `Retry-After` rounding,
-idle and backward-clock behavior, concurrent authenticated actors sharing one bucket, health isolation, and rejected writes leaving the real SQLite store unchanged.
+Coverage includes default six-second boundaries, varied rates and capacities,
+fractional drain and `Retry-After` rounding, invalid configuration, idle and
+backward-clock behavior, concurrent authenticated actors sharing one bucket,
+health isolation, and rejected writes leaving the real SQLite store unchanged.
 
 ## Endpoints
 
@@ -201,7 +235,7 @@ are arrays; the final page omits `next_page_token`.
 
 ## Examples (Go)
 
-Use the startup `TOKEN` above. Leave at least six seconds between requests, or honor `Retry-After`. JSON mutations require `Content-Type: application/json`. Send only the five writable contact fields shown below; `PUT` replaces omitted fields with empty strings. Metadata such as `id`, `owner_id` and timestamps is read-only. [API testing](go/API_TESTING.md) includes a safe read-modify-write example.
+Use the startup `TOKEN` above. With default limiter settings, leave at least six seconds between requests, or honor `Retry-After`. JSON mutations require `Content-Type: application/json`. Send only the five writable contact fields shown below; `PUT` replaces omitted fields with empty strings. Metadata such as `id`, `owner_id` and timestamps is read-only. [API testing](go/API_TESTING.md) includes a safe read-modify-write example.
 
 ```bash
 # List contacts (first page)

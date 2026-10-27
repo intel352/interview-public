@@ -7,10 +7,12 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/big"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"regexp"
 	"strconv"
 	"strings"
 	"syscall"
@@ -50,11 +52,24 @@ func run(ctx context.Context, args []string, output io.Writer) (result error) {
 	doSeed := flags.Bool("seed", false, "seed database with test data")
 	contacts := flags.Int("contacts", 10000, "number of contacts to seed")
 	files := flags.Int("files", 20, "number of files to seed")
+	rateDefaults := app.DefaultRateLimitConfig()
+	rateRequests := flags.Int64("rate-limit-requests", rateDefaults.Requests, "requests drained per rate-limit-period (shared by all business clients)")
+	ratePeriod := rateDefaults.Period
+	flags.Func("rate-limit-period", fmt.Sprintf("duration over which rate-limit-requests drain; exact nanoseconds, not a resetting window (default %s)", rateDefaults.Period), func(value string) error {
+		var err error
+		ratePeriod, err = parseRateLimitPeriod(value)
+		return err
+	})
+	rateCapacity := flags.Int64("rate-limit-capacity", rateDefaults.Capacity, "maximum business-request burst when the bucket is empty")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
 	if flags.NArg() != 0 || *contacts < 0 || *files < 0 {
 		return errors.New("unexpected arguments or negative seed counts")
+	}
+	rateConfig := app.RateLimitConfig{Requests: *rateRequests, Period: ratePeriod, Capacity: *rateCapacity}
+	if err := rateConfig.Validate(); err != nil {
+		return fmt.Errorf("rate limit: %w", err)
 	}
 	address, healthAddress, err := listenerAddresses(*addr, *healthAddr)
 	if err != nil {
@@ -120,8 +135,42 @@ func run(ctx context.Context, args []string, output io.Writer) (result error) {
 	if _, err := fmt.Fprintln(output, strings.Join(lines, "\n")); err != nil {
 		return fmt.Errorf("write startup information: %w", err)
 	}
-	handler := middleware.Logger(app.RateLimit(app.NewRouter(s, app.Options{AuthTokens: credentials})))
-	return serveBoth(ctx, listener, healthListener, handler, app.NewHealthRouter(), 5*time.Second)
+	handler, err := app.RateLimit(app.NewRouter(s, app.Options{AuthTokens: credentials}), rateConfig)
+	if err != nil {
+		return fmt.Errorf("rate limit: %w", err)
+	}
+	return serveBoth(ctx, listener, healthListener, middleware.Logger(handler), app.NewHealthRouter(), 5*time.Second)
+}
+
+var ratePeriodComponents = regexp.MustCompile(`([0-9]+(?:\.[0-9]*)?|\.[0-9]+)(ns|us|µs|μs|ms|s|m|h)`)
+
+// parseRateLimitPeriod preserves Go duration syntax but rejects fractional
+// nanoseconds that time.ParseDuration would silently discard. Exact decimal
+// arithmetic also catches truncation within composite values such as 0.5ns0.5ns.
+func parseRateLimitPeriod(value string) (time.Duration, error) {
+	parsed, err := time.ParseDuration(value)
+	if err != nil {
+		return 0, err
+	}
+	units := map[string]int64{
+		"ns": 1, "us": 1000, "µs": 1000, "μs": 1000, "ms": 1000000,
+		"s": int64(time.Second), "m": int64(time.Minute), "h": int64(time.Hour),
+	}
+	total := new(big.Rat)
+	for _, component := range ratePeriodComponents.FindAllStringSubmatch(value, -1) {
+		number, ok := new(big.Rat).SetString(component[1])
+		if !ok {
+			return 0, errors.New("invalid rate-limit-period decimal")
+		}
+		total.Add(total, number.Mul(number, new(big.Rat).SetInt64(units[component[2]])))
+	}
+	if strings.HasPrefix(value, "-") {
+		total.Neg(total)
+	}
+	if total.Cmp(new(big.Rat).SetInt64(int64(parsed))) != 0 {
+		return 0, errors.New("rate-limit-period must be exactly representable in whole nanoseconds without truncation")
+	}
+	return parsed, nil
 }
 
 func loopbackAddress(address string) (string, error) {

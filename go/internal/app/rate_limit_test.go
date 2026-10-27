@@ -23,7 +23,7 @@ func (w failedResponseWriter) Write([]byte) (int, error) {
 }
 
 func TestRateLimitAbortsInterruptedRejection(t *testing.T) {
-	h := rateLimit(http.NotFoundHandler(), func() time.Time { return time.Time{} })
+	h := defaultRateLimit(t, http.NotFoundHandler(), func() time.Time { return time.Time{} })
 	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/", nil))
 	w := failedResponseWriter{httptest.NewRecorder()}
 	defer func() {
@@ -41,7 +41,7 @@ func TestRateLimitDrainBoundaries(t *testing.T) {
 	start := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	now := start
 	calls := 0
-	h := rateLimit(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	h := defaultRateLimit(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls++
 		w.Header().Set("X-Handler", "reached")
 		w.WriteHeader(http.StatusNoContent)
@@ -90,7 +90,7 @@ func TestRateLimitDrainBoundaries(t *testing.T) {
 
 func TestRateLimitTenRequestsPerMinute(t *testing.T) {
 	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-	h := rateLimit(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}), func() time.Time { return now })
+	h := defaultRateLimit(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}), func() time.Time { return now })
 	accepted := 0
 	for second := range 60 {
 		w := httptest.NewRecorder()
@@ -115,7 +115,7 @@ func TestRateLimitTenRequestsPerMinute(t *testing.T) {
 func TestRateLimitBackwardClock(t *testing.T) {
 	start := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	now := start
-	h := rateLimit(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}), func() time.Time { return now })
+	h := defaultRateLimit(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}), func() time.Time { return now })
 	for _, tt := range []struct {
 		at   time.Duration
 		code int
@@ -136,7 +136,7 @@ func TestRateLimitConcurrentClientsShareBucket(t *testing.T) {
 	var accepted atomic.Int32
 	var rejected atomic.Int32
 	fixed := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-	h := rateLimit(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	h := defaultRateLimit(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		accepted.Add(1)
 	}), func() time.Time { return fixed })
 	start := make(chan struct{})
@@ -173,7 +173,7 @@ func TestRateLimitRejectsWhileHandlerIsBusy(t *testing.T) {
 	release := make(chan struct{})
 	finished := make(chan struct{})
 	fixed := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-	h := rateLimit(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	h := defaultRateLimit(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		close(entered)
 		<-release
 	}), func() time.Time { return fixed })
@@ -217,7 +217,7 @@ func TestRateLimitRouterWrites(t *testing.T) {
 		t.Fatal(err)
 	}
 	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-	h := rateLimit(NewRouter(s, Options{AuthTokens: map[string]string{token: "alice@example.com"}}), func() time.Time { return now })
+	h := defaultRateLimit(t, NewRouter(s, Options{AuthTokens: map[string]string{token: "alice@example.com"}}), func() time.Time { return now })
 	for i, want := range []int{http.StatusCreated, http.StatusTooManyRequests} {
 		r := httptest.NewRequest(http.MethodPost, "/api/contacts", strings.NewReader(`{"first_name":"Test","email":"test@example.com"}`))
 		r.Header.Set("Authorization", "Bearer "+token)
@@ -247,7 +247,7 @@ func TestRateLimitRouterWrites(t *testing.T) {
 func TestRateLimitIncludesAuthAndUnknownAPIRoutes(t *testing.T) {
 	const token = "test-only-rate-limit-token"
 	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-	h := rateLimit(NewRouter(nil, Options{AuthTokens: map[string]string{token: "alice@example.com"}}), func() time.Time { return now })
+	h := defaultRateLimit(t, NewRouter(nil, Options{AuthTokens: map[string]string{token: "alice@example.com"}}), func() time.Time { return now })
 	for _, tt := range []struct {
 		advance time.Duration
 		method  string
@@ -273,4 +273,14 @@ func TestRateLimitIncludesAuthAndUnknownAPIRoutes(t *testing.T) {
 			t.Fatalf("%s %s: got status %d, want %d", tt.method, tt.path, w.Code, tt.code)
 		}
 	}
+}
+
+// Existing scenarios independently pin the original 10/minute, capacity-one defaults.
+func defaultRateLimit(t *testing.T, next http.Handler, now func() time.Time) http.Handler {
+	t.Helper()
+	handler, err := rateLimit(next, DefaultRateLimitConfig(), now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return handler
 }

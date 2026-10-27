@@ -19,7 +19,7 @@ func TestBDDGlobalRateLimitAcrossHTTPConsumers(t *testing.T) {
 	start := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	var elapsed atomic.Int64
 	world := givenBDDApp(t, func(next http.Handler) http.Handler {
-		return rateLimit(next, func() time.Time {
+		return defaultRateLimit(t, next, func() time.Time {
 			return start.Add(time.Duration(elapsed.Load()))
 		})
 	})
@@ -52,7 +52,7 @@ func TestBDDGlobalRateLimitAcrossHTTPConsumers(t *testing.T) {
 	// subtests: the second phase depends on the first wave filling the bucket.
 	// When the first API wave follows health requests, Then one write persists.
 	assertHealthAvailable(t)
-	admitted = append(admitted, whenBDDConsumersCreate(t, consumers, "first"))
+	admitted = append(admitted, whenBDDConsumersCreate(t, consumers, "first", 1, "6")...)
 	thenBDDCreationsAndAudits(t, world, admitted)
 
 	// Given a full API bucket, When health is checked, Then health succeeds
@@ -77,13 +77,50 @@ func TestBDDGlobalRateLimitAcrossHTTPConsumers(t *testing.T) {
 	// Then exactly one more mutation is admitted across all actors.
 	elapsed.Store(int64(6 * time.Second))
 	assertHealthAvailable(t)
-	admitted = append(admitted, whenBDDConsumersCreate(t, consumers, "second"))
+	admitted = append(admitted, whenBDDConsumersCreate(t, consumers, "second", 1, "6")...)
 	thenBDDCreationsAndAudits(t, world, admitted)
 }
 
 type bddAdmission struct{ contactID, actor string }
 
-func whenBDDConsumersCreate(t *testing.T, consumers []bddWorld, wave string) bddAdmission {
+func TestBDDConfiguredGlobalRateLimitAcrossHTTPConsumers(t *testing.T) {
+	// Given twelve actual HTTP consumers sharing a three-request burst and
+	// a fractional one-third-second drain interval across two actor identities.
+	var elapsed atomic.Int64
+	start := time.Unix(0, 0)
+	world := givenBDDApp(t, func(next http.Handler) http.Handler {
+		handler, err := rateLimit(next, RateLimitConfig{Requests: 3, Period: time.Second, Capacity: 3}, func() time.Time {
+			return start.Add(time.Duration(elapsed.Load()))
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return handler
+	})
+	consumers := make([]bddWorld, 12)
+	actors := []string{"alice@example.com", "bob@example.com"}
+	for i := range consumers {
+		consumers[i] = *world.forActor(t, actors[i%len(actors)])
+	}
+	// When racing at the same instant, Then only the burst capacity reaches
+	// the real SQLite mutation/audit transaction, regardless of actor.
+	admitted := whenBDDConsumersCreate(t, consumers, "burst", 3, "1")
+	thenBDDCreationsAndAudits(t, world, admitted)
+	elapsed.Store(333333333)
+	whenBDDConsumersCreate(t, consumers, "too early", 0, "1")
+	thenBDDCreationsAndAudits(t, world, admitted)
+	// When enough fractional work drains, Then one slot, not a whole new
+	// burst, becomes available; rejection never advances the deadline.
+	elapsed.Store(333333334)
+	admitted = append(admitted, whenBDDConsumersCreate(t, consumers, "refilled", 1, "1")...)
+	thenBDDCreationsAndAudits(t, world, admitted)
+	// When long idle empties the bucket, Then capacity is restored but not exceeded.
+	elapsed.Store(int64(time.Hour))
+	admitted = append(admitted, whenBDDConsumersCreate(t, consumers, "after idle", 3, "1")...)
+	thenBDDCreationsAndAudits(t, world, admitted)
+}
+
+func whenBDDConsumersCreate(t *testing.T, consumers []bddWorld, wave string, wantAccepted int, wantRetry string) []bddAdmission {
 	t.Helper()
 	type outcome struct {
 		response bddResponse
@@ -102,12 +139,12 @@ func whenBDDConsumersCreate(t *testing.T, consumers []bddWorld, wave string) bdd
 		})
 	}
 	// When all consumers are released together, request order is deliberately
-	// unspecified; only the single shared allowance determines admission.
+	// unspecified; only the shared allowance determines admission.
 	close(ready)
 	group.Wait()
 	close(results)
 	accepted, rejected := 0, 0
-	var admitted bddAdmission
+	var admitted []bddAdmission
 	for result := range results {
 		if result.err != nil {
 			t.Errorf("When consumer sends request: %v", result.err)
@@ -117,22 +154,22 @@ func whenBDDConsumersCreate(t *testing.T, consumers []bddWorld, wave string) bdd
 		case http.StatusCreated:
 			accepted++
 			contact := decodeBDD[store.Contact](t, result.response)
-			admitted = bddAdmission{contactID: contact.ID, actor: result.actor}
+			admitted = append(admitted, bddAdmission{contactID: contact.ID, actor: result.actor})
 			if contact.ID == "" || contact.OwnerID != result.actor || !strings.HasPrefix(contact.FirstName, wave+" consumer ") {
 				t.Errorf("Then admitted mutation returns its created contact: %+v", contact)
 			}
 		case http.StatusTooManyRequests:
 			rejected++
 			body := decodeBDD[map[string]string](t, result.response)
-			if len(body) != 1 || body["error"] != "rate limit exceeded" || result.response.header.Get("Retry-After") != "6" || result.response.header.Get("Content-Type") != "application/json" || result.response.header.Get("Cache-Control") != "no-store" {
+			if len(body) != 1 || body["error"] != "rate limit exceeded" || result.response.header.Get("Retry-After") != wantRetry || result.response.header.Get("Content-Type") != "application/json" || result.response.header.Get("Cache-Control") != "no-store" {
 				t.Errorf("Then overflow returns the documented rejection: body=%v headers=%v", body, result.response.header)
 			}
 		default:
 			t.Errorf("Then consumer gets either 201 or 429, got %d: %.1024s", result.response.status, result.response.body)
 		}
 	}
-	if accepted != 1 || rejected != len(consumers)-1 {
-		t.Fatalf("Then one global slot admits one consumer across all actors: accepted=%d rejected=%d, want 1 and %d", accepted, rejected, len(consumers)-1)
+	if accepted != wantAccepted || rejected != len(consumers)-wantAccepted {
+		t.Fatalf("Then the global allowance is shared across all actors: accepted=%d rejected=%d, want %d and %d", accepted, rejected, wantAccepted, len(consumers)-wantAccepted)
 	}
 	return admitted
 }
