@@ -61,36 +61,55 @@ func RateLimit(next http.Handler, config RateLimitConfig) (http.Handler, error) 
 	return rateLimit(next, config, time.Now)
 }
 
+// RateLimitMiddleware validates a policy and returns standard HTTP middleware.
+// Reusing the returned function shares actor buckets across wrapped handlers;
+// call this constructor again for an independent policy, such as a stricter
+// endpoint limit. Authentication must run before this middleware.
+// Each layer charges its own admissions, including attempts rejected downstream.
+func RateLimitMiddleware(config RateLimitConfig) (func(http.Handler) http.Handler, error) {
+	return rateLimitMiddleware(config, time.Now)
+}
+
 func rateLimit(next http.Handler, config RateLimitConfig, now func() time.Time) (http.Handler, error) {
+	limit, err := rateLimitMiddleware(config, now)
+	if err != nil {
+		return nil, err
+	}
+	return limit(next), nil
+}
+
+func rateLimitMiddleware(config RateLimitConfig, now func() time.Time) (func(http.Handler) http.Handler, error) {
 	if err := config.Validate(); err != nil {
 		return nil, err
 	}
 	// Keys come only from authenticated context, never raw credentials or client
 	// labels. State grows with configured actors that actually make requests.
-	var buckets sync.Map // map[string]*leakyBucket; entries live for this wrapper.
+	var buckets sync.Map // map[string]*leakyBucket; entries live for this policy.
 
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		actor := auth.UserID(r.Context())
-		value, ok := buckets.Load(actor)
-		if !ok {
-			value, _ = buckets.LoadOrStore(actor, &leakyBucket{})
-		}
-		retryAfter := value.(*leakyBucket).admit(config, now)
-		if retryAfter > 0 {
-			seconds := ceilDivide(retryAfter, int64(time.Second))
-			w.Header().Set("Retry-After", strconv.FormatInt(seconds, 10))
-			w.Header().Set("Content-Type", "application/json")
-			w.Header().Set("Cache-Control", "no-store")
-			w.WriteHeader(http.StatusTooManyRequests)
-			// Abort an interrupted response; its status is already committed.
-			if _, err := w.Write([]byte("{\"error\":\"rate limit exceeded\"}\n")); err != nil {
-				log.Print("write rate limit response failed")
-				panic(http.ErrAbortHandler)
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			actor := auth.UserID(r.Context())
+			value, ok := buckets.Load(actor)
+			if !ok {
+				value, _ = buckets.LoadOrStore(actor, &leakyBucket{})
 			}
-			return
-		}
-		next.ServeHTTP(w, r)
-	}), nil
+			retryAfter := value.(*leakyBucket).admit(config, now)
+			if retryAfter > 0 {
+				seconds := ceilDivide(retryAfter, int64(time.Second))
+				w.Header().Set("Retry-After", strconv.FormatInt(seconds, 10))
+				w.Header().Set("Content-Type", "application/json")
+				w.Header().Set("Cache-Control", "no-store")
+				w.WriteHeader(http.StatusTooManyRequests)
+				// Abort an interrupted response; its status is already committed.
+				if _, err := w.Write([]byte("{\"error\":\"rate limit exceeded\"}\n")); err != nil {
+					log.Print("write rate limit response failed")
+					panic(http.ErrAbortHandler)
+				}
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}, nil
 }
 
 type leakyBucket struct {

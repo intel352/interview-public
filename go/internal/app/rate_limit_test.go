@@ -191,9 +191,7 @@ func TestRateLimitConcurrentAnonymousClientsShareBucket(t *testing.T) {
 	start := make(chan struct{})
 	var wg sync.WaitGroup
 	for i := range 100 {
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
+		wg.Go(func() {
 			r := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/client/%d", i), nil)
 			r.RemoteAddr = fmt.Sprintf("192.0.2.%d:1234", i+1)
 			r.Header.Set("Authorization", fmt.Sprintf("Bearer user%d@example.com", i))
@@ -208,7 +206,7 @@ func TestRateLimitConcurrentAnonymousClientsShareBucket(t *testing.T) {
 			} else if w.Code != http.StatusOK {
 				t.Errorf("client %d: unexpected status %d", i, w.Code)
 			}
-		}(i)
+		})
 	}
 	close(start)
 	wg.Wait()
@@ -286,6 +284,8 @@ func TestRateLimitConcurrentActorsHaveIndependentCapacity(t *testing.T) {
 }
 
 func TestRateLimitRejectsWhileHandlerIsBusy(t *testing.T) {
+	// With a fixed clock the bucket stays full. This proves prompt rejection,
+	// not a restriction on the number of concurrently running handlers.
 	entered := make(chan struct{})
 	release := make(chan struct{})
 	finished := make(chan struct{})
@@ -316,6 +316,71 @@ func TestRateLimitRejectsWhileHandlerIsBusy(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("rejection waited for the admitted handler to finish")
+	}
+}
+
+func TestRateLimitAdmitsAfterRefillWhileHandlerIsBusy(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	finished := make(chan struct{})
+	var nextFinished chan struct{}
+	var elapsed atomic.Int64
+	start := time.Unix(0, 0)
+	h := auth.TokenParser(map[string]string{"slow-test-token": "alice"})(defaultRateLimit(t,
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/slow" {
+				close(entered)
+				<-release
+			}
+			w.WriteHeader(http.StatusNoContent)
+		}), func() time.Time { return start.Add(time.Duration(elapsed.Load())) }))
+	request := func(path string) *http.Request {
+		r := httptest.NewRequest(http.MethodGet, path, nil)
+		r.Header.Set("Authorization", "Bearer slow-test-token")
+		return r
+	}
+	t.Cleanup(func() {
+		close(release)
+		<-finished
+		if nextFinished != nil {
+			<-nextFinished
+		}
+	})
+	go func() {
+		defer close(finished)
+		response := httptest.NewRecorder()
+		h.ServeHTTP(response, request("/slow"))
+		if response.Code != http.StatusNoContent {
+			t.Errorf("slow response status=%d, want 204", response.Code)
+		}
+	}()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first handler did not start")
+	}
+	// Advancing time drains the bucket without releasing the first handler.
+	elapsed.Store(int64(6 * time.Second))
+	completed := make(chan int, 1)
+	nextFinished = make(chan struct{})
+	go func() {
+		defer close(nextFinished)
+		response := httptest.NewRecorder()
+		h.ServeHTTP(response, request("/next"))
+		completed <- response.Code
+	}()
+	select {
+	case code := <-completed:
+		if code != http.StatusNoContent {
+			t.Fatalf("refilled request status=%d, want 204", code)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("refilled request waited for the first handler to finish")
+	}
+	select {
+	case <-finished:
+		t.Fatal("first handler finished before being released")
+	default:
 	}
 }
 

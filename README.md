@@ -105,6 +105,10 @@ rate; admission is evaluated at nanosecond clock resolution. Capacity greater
 than one permits bursts, so the configured count is not a strict request ceiling
 for each fixed or rolling period.
 
+Rate and burst capacity are separate: with the default 10/minute drain rate,
+`--rate-limit-capacity=10` permits ten immediate admissions per actor, then one
+more after six seconds. The default capacity remains one.
+
 Invalid explicit settings fail startup before opening data/listeners or printing
 credentials. Count/capacity must fit signed 64-bit integers; the period must fit a Go
 duration. Period text that would lose fractional nanoseconds (such as `1.5ns`)
@@ -159,6 +163,14 @@ The server constructs `NewRateLimitedRouter` once in `cmd/server`, ensuring
 authentication precedes actor-bucket selection. The standalone `RateLimit`
 wrapper requires authenticated context upstream. `NewRouter` remains reusable
 without limiting so existing benchmarks continue to measure CRM handlers.
+
+`RateLimitMiddleware(config)` validates a policy and returns
+`func(http.Handler) http.Handler` for `r.Use(...)` or endpoint-specific
+`r.With(...)` composition. Authenticate upstream. Reuse one middleware instance
+to share its actor budgets across handlers; construct another instance for an
+independent, stricter endpoint policy. When layers are stacked, an outer
+admission still consumes allowance if an inner policy rejects the request;
+there is no composite admission transaction or automatic refund.
 
 Run the tests from `go/`:
 

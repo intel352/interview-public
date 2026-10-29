@@ -18,21 +18,33 @@ type Options struct {
 }
 
 func NewRouter(s *store.Store, opts Options) http.Handler {
-	return withRequestLogging(auth.TokenParser(opts.AuthTokens)(newRouter(s)), opts.EnableLogging)
+	return newAuthenticatedRouter(s, opts, nil)
 }
 
 // NewRateLimitedRouter authenticates each request before selecting its actor's
 // bucket, then applies the same routing and authorization as NewRouter.
 func NewRateLimitedRouter(s *store.Store, opts Options, config RateLimitConfig) (http.Handler, error) {
-	return newRateLimitedRouter(s, opts, config, time.Now)
-}
-
-func newRateLimitedRouter(s *store.Store, opts Options, config RateLimitConfig, now func() time.Time) (http.Handler, error) {
-	handler, err := rateLimit(newRouter(s), config, now)
+	limit, err := RateLimitMiddleware(config)
 	if err != nil {
 		return nil, err
 	}
-	return withRequestLogging(auth.TokenParser(opts.AuthTokens)(handler), opts.EnableLogging), nil
+	return newAuthenticatedRouter(s, opts, limit), nil
+}
+
+func newRateLimitedRouter(s *store.Store, opts Options, config RateLimitConfig, now func() time.Time) (http.Handler, error) {
+	limit, err := rateLimitMiddleware(config, now)
+	if err != nil {
+		return nil, err
+	}
+	return newAuthenticatedRouter(s, opts, limit), nil
+}
+
+func newAuthenticatedRouter(s *store.Store, opts Options, limit func(http.Handler) http.Handler) http.Handler {
+	handler := newRouter(s)
+	if limit != nil {
+		handler = limit(handler)
+	}
+	return withRequestLogging(auth.TokenParser(opts.AuthTokens)(handler), opts.EnableLogging)
 }
 
 func withRequestLogging(handler http.Handler, enabled bool) http.Handler {
