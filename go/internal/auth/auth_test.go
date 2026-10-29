@@ -129,16 +129,6 @@ func TestActorConfiguration(t *testing.T) {
 }
 
 func TestActorConfigurationBoundariesAndFailClosedMapping(t *testing.T) {
-	actors := make([]string, 64)
-	for i := range actors {
-		actors[i] = fmt.Sprintf("actor-%d", i)
-	}
-	if err := ValidateActors(actors); err != nil {
-		t.Fatal(err)
-	}
-	if err := ValidateActors(append(actors, "one-too-many")); err == nil {
-		t.Fatal("accepted 65 actors")
-	}
 	if err := ValidateActors([]string{strings.Repeat("a", 254)}); err != nil {
 		t.Fatal(err)
 	}
@@ -147,11 +137,7 @@ func TestActorConfigurationBoundariesAndFailClosedMapping(t *testing.T) {
 			t.Error("accepted invalid actor")
 		}
 	}
-	tooMany := make(map[string]string)
-	for i := range 65 {
-		tooMany[fmt.Sprintf("token-%d", i)] = fmt.Sprintf("actor-%d", i)
-	}
-	for _, credentials := range []map[string]string{nil, {"token-0": ""}, {"token-0": "two words"}, {"token-0": "actor-0", "": "actor-1"}, tooMany} {
+	for _, credentials := range []map[string]string{nil, {"token-0": ""}, {"token-0": "two words"}, {"token-0": "actor-0", "": "actor-1"}} {
 		handler := TokenParser(credentials)(RequireAuth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { t.Error("invalid configuration reached handler") })))
 		request := httptest.NewRequest(http.MethodGet, "/", nil)
 		request.Header.Set("Authorization", "Bearer token-0")
@@ -159,6 +145,70 @@ func TestActorConfigurationBoundariesAndFailClosedMapping(t *testing.T) {
 		handler.ServeHTTP(response, request)
 		if response.Code != http.StatusUnauthorized {
 			t.Errorf("invalid mapping returned %d", response.Code)
+		}
+	}
+}
+
+func TestActorConfigurationHasNoFixedCountLimit(t *testing.T) {
+	actors := make([]string, 256)
+	for i := range actors {
+		actors[i] = fmt.Sprintf("actor-%d", i)
+	}
+	parsed, err := ParseActors(strings.Join(actors, ","))
+	if err != nil || len(parsed) != len(actors) {
+		t.Fatalf("parse %d actors: count=%d error=%v", len(actors), len(parsed), err)
+	}
+	credentials, err := NewCredentials(parsed)
+	if err != nil || len(credentials) != len(actors) {
+		t.Fatalf("credentials for %d actors: count=%d error=%v", len(actors), len(credentials), err)
+	}
+	handler := TokenParser(credentials)(RequireAuth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Actor", UserID(r.Context()))
+	})))
+	seen := make(map[string]bool, len(actors))
+	for token, actor := range credentials {
+		request := httptest.NewRequest(http.MethodGet, "/", nil)
+		request.Header.Set("Authorization", "Bearer "+token)
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		if response.Code != http.StatusOK || response.Header().Get("Actor") != actor {
+			t.Fatalf("configured actor %q: status=%d actor=%q", actor, response.Code, response.Header().Get("Actor"))
+		}
+		seen[actor] = true
+	}
+	for _, actor := range actors {
+		if !seen[actor] {
+			t.Errorf("actor %q has no usable credential", actor)
+		}
+	}
+	request := httptest.NewRequest(http.MethodGet, "/", nil)
+	request.Header.Set("Authorization", "Bearer unconfigured-token")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("unknown credential: status=%d", response.Code)
+	}
+}
+
+func TestTokenParserSupportsLargeSnapshotAndActorAliases(t *testing.T) {
+	credentials := make(map[string]string, 257)
+	for i := range 256 {
+		credentials[fmt.Sprintf("token-%d", i)] = fmt.Sprintf("actor-%d", i)
+	}
+	credentials["alias-token"] = "actor-255"
+	handler := TokenParser(credentials)(RequireAuth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Actor", UserID(r.Context()))
+	})))
+	// The keyed snapshot must survive caller mutation, including the last actor
+	// and a second credential for that same actor.
+	clear(credentials)
+	for token, actor := range map[string]string{"token-0": "actor-0", "token-255": "actor-255", "alias-token": "actor-255"} {
+		request := httptest.NewRequest(http.MethodGet, "/", nil)
+		request.Header.Set("Authorization", "Bearer "+token)
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		if response.Code != http.StatusOK || response.Header().Get("Actor") != actor {
+			t.Errorf("snapshot credential %q: status=%d actor=%q, want %q", token, response.Code, response.Header().Get("Actor"), actor)
 		}
 	}
 }

@@ -5,16 +5,25 @@ actor ownership, HTTP/resource boundaries, storage consistency and lifecycle.
 See [compatibility review](COMPATIBILITY.md) for behavior
 changes from the starter and [API testing](API_TESTING.md) for scenario evidence.
 
+The [production CI/CD and OpenAPI plan](../docs/PRODUCTIONIZATION.md#cicd-and-openapi-contracts)
+records required lint/race/BDD/integration gates, contract validation/versioning,
+and generated API code integrated into the server harness as future work.
+
 ## Local actors and ownership
 
 The API and health servers bind only numeric loopback addresses. After both bind,
 startup generates one 256-bit random token per configured actor and prints each
 once to the local operator. Defaults are `alice@example.com,bob@example.com`;
-`--actors` accepts 1–64 case-sensitive labels, each at most 254 UTF-8 bytes without
+`--actors` accepts one or more unique case-sensitive labels without a fixed
+count maximum, each at most 254 UTF-8 bytes without
 whitespace, commas or controls. They are local labels, not verified email claims.
 Tokens stay in memory and rotate on restart. Email-shaped strings do not grant
 access. Duplicate authorization headers and invalid/empty mappings fail closed;
-the immutable middleware snapshot compares credentials in constant time.
+the immutable middleware snapshot uses SHA-256 credential digests as map keys.
+Authentication performs a keyed lookup without scanning actors; map lookups are
+not guaranteed constant-time. Credential memory scales with configured actors.
+Actor registration remains startup-configured; no runtime registration endpoint
+is exposed.
 
 An authenticated actor is carried into every contact/file ownership and audit
 operation. The schema has an actor registry, non-null ownership columns and
@@ -40,12 +49,22 @@ a partial bind is closed.
 
 The health listener exposes only public `GET /health`, returning process liveness
 without database details. It has no business handlers and never uses the API
-limiter. The API listener has no health handler. One global leaky bucket on the
-API listener defaults to one request per six seconds across all actors and
-outcomes. Count, period and capacity are startup flags; larger capacity permits
-bursts. Invalid settings fail before resources open. Rejected requests return
-non-cacheable JSON `429` and rounded-up `Retry-After` until one more request fits.
-It limits admissions, not concurrent in-flight handlers or fairness. See the
+limiter. The API listener has no health handler. After credential parsing, a
+concurrent map selects an independent leaky bucket by authenticated actor ID.
+Each actor defaults to one request per six seconds; clients and credentials for
+the same actor share its bucket. Missing, malformed and invalid credentials
+share one separate anonymous bucket, so they cannot exhaust an actor's allowance.
+Routing failures and handler errors still charge the selected bucket.
+
+Count, period and capacity are startup flags applied to each bucket; larger
+capacity permits bursts. Invalid settings fail before resources open. Rejected
+requests return non-cacheable JSON `429` and rounded-up `Retry-After` for their
+selected bucket. Per-bucket mutexes guard clock/drain/admit without locking
+handlers. Buckets are created lazily, and unknown tokens cannot grow the map.
+Memory scales with active configured actors, state resets on restart, and
+separate processes have independent limits. Aggregate throughput grows with
+actor count. This isolates admission budgets; CPU, storage and in-flight work
+remain shared. See the
 [configuration contract](../README.md#request-limiting) for precision and bounds.
 
 Both servers set 5-second header, 30-second read/write/request and 60-second idle
@@ -144,9 +163,10 @@ golangci-lint run --no-config ./...
 govulncheck -test ./...
 ```
 
-Use Go 1.27.3 and a compatible official linter (validation uses golangci-lint
-2.15.0 built with Go 1.27.0). The official vulnerability scanner is govulncheck
-1.9.0 built with Go 1.27.3. No linter exclusions or weakened rule set were added.
+Use Go 1.27.3 and linter/scanner versions that support its language and export
+data format. Verification on 2026-10-29 used golangci-lint 2.15.0 and govulncheck
+1.9.0, both built with Go 1.27.3: full lint reported zero issues and source
+analysis including tests reported no vulnerabilities. See [review evidence](../docs/reviews/2026-10-29-pending-changes.md).
 Tests and benchmarks check actual statuses/errors and clean up before os.Exit.
 Passing race tests or advisory scans does not establish absence of every possible
 race or vulnerability; explicit coverage and exclusions are in API_TESTING.md.

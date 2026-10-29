@@ -3,7 +3,7 @@ package auth
 import (
 	"context"
 	"crypto/rand"
-	"crypto/subtle"
+	"crypto/sha256"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -27,8 +27,8 @@ func ParseActors(value string) ([]string, error) {
 }
 
 func ValidateActors(actors []string) error {
-	if len(actors) == 0 || len(actors) > 64 {
-		return errors.New("configure between 1 and 64 actors")
+	if len(actors) == 0 {
+		return errors.New("configure at least one actor")
 	}
 	seen := make(map[string]bool, len(actors))
 	for _, actor := range actors {
@@ -72,15 +72,15 @@ func NewToken() (string, error) {
 
 // TokenParser snapshots the token-to-actor mapping so later caller changes do
 // not alter authentication or introduce concurrent map access during requests.
+// Fixed-size credential digests allow keyed lookup without scanning actors.
 func TokenParser(credentials map[string]string) func(http.Handler) http.Handler {
-	type credential struct{ token, actor string }
-	expected := make([]credential, 0, len(credentials))
+	expected := make(map[[sha256.Size]byte]string, len(credentials))
 	for token, actor := range credentials {
-		if token == "" || ValidateActors([]string{actor}) != nil || len(credentials) > 64 {
+		if token == "" || ValidateActors([]string{actor}) != nil {
 			expected = nil // Invalid configuration fails closed.
 			break
 		}
-		expected = append(expected, credential{token, actor})
+		expected[sha256.Sum256([]byte(token))] = actor
 	}
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -88,12 +88,7 @@ func TokenParser(credentials map[string]string) func(http.Handler) http.Handler 
 			if len(values) == 1 {
 				scheme, token, ok := strings.Cut(values[0], " ")
 				if ok && strings.EqualFold(scheme, "Bearer") {
-					var actor string
-					for _, candidate := range expected {
-						if subtle.ConstantTimeCompare([]byte(token), []byte(candidate.token)) == 1 {
-							actor = candidate.actor
-						}
-					}
+					actor := expected[sha256.Sum256([]byte(token))]
 					if actor != "" {
 						r = r.WithContext(context.WithValue(r.Context(), contextKey{}, actor))
 					}

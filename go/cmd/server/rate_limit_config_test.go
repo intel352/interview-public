@@ -102,6 +102,10 @@ func TestRateLimitPeriodParsing(t *testing.T) {
 }
 
 func TestBDDConfiguredRateLimitGovernsActualServer(t *testing.T) {
+	manyActors := make([]string, 128)
+	for i := range manyActors {
+		manyActors[i] = fmt.Sprintf("actor-%03d", i)
+	}
 	for _, scenario := range []struct {
 		name       string
 		args       []string
@@ -110,10 +114,11 @@ func TestBDDConfiguredRateLimitGovernsActualServer(t *testing.T) {
 	}{
 		{"defaults", nil, 1, 6},
 		{"custom count period and burst", []string{"--rate-limit-requests=3", "--rate-limit-period=30m", "--rate-limit-capacity=2"}, 2, 600},
+		{"more than 64 actors", []string{"--actors=" + strings.Join(manyActors, ","), "--rate-limit-period=1h"}, 1, 360},
 	} {
 		t.Run(scenario.name, func(t *testing.T) {
 			// Given the actual CLI, independent listeners and ephemeral actor
-			// credentials, When clients consume the configured shared burst,
+			// credentials, When clients consume each actor's configured burst,
 			// Then only admitted writes and their correct audit actors persist.
 			data := t.TempDir()
 			apiURL, healthURL, tokens, stop := givenRateLimitedServer(t, data, scenario.args)
@@ -123,17 +128,21 @@ func TestBDDConfiguredRateLimitGovernsActualServer(t *testing.T) {
 				demoRequest(t, client, http.MethodGet, healthURL+"/health", "", http.StatusOK)
 			}
 			actors := []string{"alice@example.com", "bob@example.com"}
+			if scenario.name == "more than 64 actors" {
+				actors = manyActors
+			}
 			var created []store.Contact
 			started := time.Now()
-			for i := range scenario.capacity {
-				actor := actors[i%len(actors)]
-				body := demoJSONRequest(t, client, http.MethodPost, apiURL+"/api/contacts", tokens[actor],
-					strings.NewReader(fmt.Sprintf(`{"first_name":"Admission %d"}`, i)), http.StatusCreated)
-				var contact store.Contact
-				if err := json.Unmarshal(body, &contact); err != nil || contact.ID == "" || contact.OwnerID != actor || contact.FirstName != fmt.Sprintf("Admission %d", i) {
-					t.Fatalf("Then admitted record must retain submitted fields and actor: %+v, %v", contact, err)
+			for _, actor := range actors {
+				for i := range scenario.capacity {
+					body := demoJSONRequest(t, client, http.MethodPost, apiURL+"/api/contacts", tokens[actor],
+						strings.NewReader(fmt.Sprintf(`{"first_name":"Admission %d"}`, i)), http.StatusCreated)
+					var contact store.Contact
+					if err := json.Unmarshal(body, &contact); err != nil || contact.ID == "" || contact.OwnerID != actor || contact.FirstName != fmt.Sprintf("Admission %d", i) {
+						t.Fatalf("Then admitted record must retain submitted fields and actor: %+v, %v", contact, err)
+					}
+					created = append(created, contact)
 				}
-				created = append(created, contact)
 			}
 			for _, actor := range actors {
 				request, err := http.NewRequestWithContext(t.Context(), http.MethodPost, apiURL+"/api/contacts", strings.NewReader(`{"first_name":"Rejected"}`))
@@ -155,10 +164,10 @@ func TestBDDConfiguredRateLimitGovernsActualServer(t *testing.T) {
 				// exact nanosecond and refill boundaries use injected-clock tests.
 				minimumRetry := max(1, scenario.retryAfter-int64(time.Since(started)/time.Second)-1)
 				if response.StatusCode != http.StatusTooManyRequests || err != nil || retry < minimumRetry || retry > scenario.retryAfter || string(body) != "{\"error\":\"rate limit exceeded\"}\n" {
-					t.Fatalf("Then both actors share configured overflow: status=%d, retry=%q, body=%q", response.StatusCode, response.Header.Get("Retry-After"), body)
+					t.Fatalf("Then each actor has configured overflow: status=%d, retry=%q, body=%q", response.StatusCode, response.Header.Get("Retry-After"), body)
 				}
 			}
-			// Health still bypasses the exhausted business bucket.
+			// Health still bypasses every exhausted actor bucket.
 			demoRequest(t, client, http.MethodGet, healthURL+"/health", "", http.StatusOK)
 			stop()
 			s, err := store.New(data)
@@ -175,8 +184,21 @@ func TestBDDConfiguredRateLimitGovernsActualServer(t *testing.T) {
 				s.DB().QueryRowContext(t.Context(), "SELECT COUNT(*) FROM activity_log").Scan(&audits)); err != nil {
 				t.Fatal(err)
 			}
-			if contacts != scenario.capacity || audits != scenario.capacity {
-				t.Fatalf("Then rejected writes leave no record or audit: contacts=%d, audits=%d, want %d each", contacts, audits, scenario.capacity)
+			wantTotal := scenario.capacity * len(actors)
+			if contacts != wantTotal || audits != wantTotal {
+				t.Fatalf("Then rejected writes leave no record or audit: contacts=%d, audits=%d, want %d each", contacts, audits, wantTotal)
+			}
+			for _, actor := range actors {
+				var owned, attributed int
+				if err := s.DB().QueryRowContext(t.Context(), "SELECT COUNT(*) FROM contacts WHERE owner_id=?", actor).Scan(&owned); err != nil {
+					t.Fatal(err)
+				}
+				if err := s.DB().QueryRowContext(t.Context(), "SELECT COUNT(*) FROM activity_log WHERE user_id=?", actor).Scan(&attributed); err != nil {
+					t.Fatal(err)
+				}
+				if owned != scenario.capacity || attributed != scenario.capacity {
+					t.Fatalf("Then actor %s has exactly its allowance: contacts=%d audits=%d want=%d", actor, owned, attributed, scenario.capacity)
+				}
 			}
 			for _, contact := range created {
 				stored, err := s.GetContact(t.Context(), contact.OwnerID, contact.ID)
@@ -221,7 +243,13 @@ func givenRateLimitedServer(t *testing.T, data string, policyArgs []string) (api
 		t.Fatal("Given configured server startup timed out")
 	}
 	lines := strings.Split(strings.TrimSpace(output.snapshot()), "\n")
-	actors, err := auth.ParseActors(auth.DefaultActors)
+	actorList := auth.DefaultActors
+	for _, arg := range policyArgs {
+		if value, ok := strings.CutPrefix(arg, "--actors="); ok {
+			actorList = value
+		}
+	}
+	actors, err := auth.ParseActors(actorList)
 	if err != nil || len(lines) != 2+len(actors) {
 		t.Fatal("Then startup must report two listeners and each configured actor")
 	}

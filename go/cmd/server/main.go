@@ -59,7 +59,7 @@ func run(ctx context.Context, args []string, output io.Writer) (result error) {
 	files := flags.Int("files", 20, "number of files to seed")
 	rateDefaults := app.DefaultRateLimitConfig()
 	rateRequests := rateDefaults.Requests
-	flags.Func("rate-limit-requests", fmt.Sprintf("requests drained per rate-limit-period (shared by all business clients; default %d)", rateDefaults.Requests), func(value string) error {
+	flags.Func("rate-limit-requests", fmt.Sprintf("requests drained per rate-limit-period for each actor (default %d)", rateDefaults.Requests), func(value string) error {
 		var err error
 		rateRequests, err = parseRateLimitInteger(value)
 		return err
@@ -71,7 +71,7 @@ func run(ctx context.Context, args []string, output io.Writer) (result error) {
 		return err
 	})
 	rateCapacity := rateDefaults.Capacity
-	flags.Func("rate-limit-capacity", fmt.Sprintf("maximum business-request burst when the bucket is empty (default %d)", rateDefaults.Capacity), func(value string) error {
+	flags.Func("rate-limit-capacity", fmt.Sprintf("maximum business-request burst per actor when its bucket is empty (default %d)", rateDefaults.Capacity), func(value string) error {
 		var err error
 		rateCapacity, err = parseRateLimitInteger(value)
 		return err
@@ -156,7 +156,7 @@ func run(ctx context.Context, args []string, output io.Writer) (result error) {
 	if _, err := fmt.Fprintln(output, strings.Join(lines, "\n")); err != nil {
 		return fmt.Errorf("write startup information: %w", err)
 	}
-	handler, err := app.RateLimit(app.NewRouter(s, app.Options{AuthTokens: credentials}), rateConfig)
+	handler, err := app.NewRateLimitedRouter(s, app.Options{AuthTokens: credentials}, rateConfig)
 	if err != nil {
 		return fmt.Errorf("rate limit: %w", err)
 	}

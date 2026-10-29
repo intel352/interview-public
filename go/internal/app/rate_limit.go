@@ -9,6 +9,8 @@ import (
 	"strconv"
 	"sync"
 	"time"
+
+	"github.com/weave-lab/interview-public/go/internal/auth"
 )
 
 // RateLimitConfig defines a drain rate and a maximum burst, not a fixed window.
@@ -50,8 +52,10 @@ func (c RateLimitConfig) Validate() error {
 	return errors.Join(problems...)
 }
 
-// RateLimit applies one shared leaky bucket to next. Overflow is rejected instead
-// of queued. The default policy is ten requests/minute with capacity one.
+// RateLimit applies an independent leaky bucket per authenticated actor to next.
+// Overflow is rejected instead of queued. Requests without an authenticated actor
+// share one anonymous bucket. Authentication must run before this handler;
+// application callers should use NewRateLimitedRouter for that composition.
 // Create this wrapper once for the server, not once per request or client.
 func RateLimit(next http.Handler, config RateLimitConfig) (http.Handler, error) {
 	return rateLimit(next, config, time.Now)
@@ -61,37 +65,17 @@ func rateLimit(next http.Handler, config RateLimitConfig, now func() time.Time) 
 	if err := config.Validate(); err != nil {
 		return nil, err
 	}
-	// One request adds Period nanoseconds of work; each elapsed nanosecond drains
-	// Requests units. This integer scale preserves rates such as three/second.
-	cost := int64(config.Period)
-	admissionThreshold := cost*config.Capacity - cost
-	var mu sync.Mutex
-	var level int64
-	last := now()
+	// Keys come only from authenticated context, never raw credentials or client
+	// labels. State grows with configured actors that actually make requests.
+	var buckets sync.Map // map[string]*leakyBucket; entries live for this wrapper.
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		mu.Lock()
-		current := now()
-		// Lazy draining avoids a background ticker. Never move last backwards.
-		if current.After(last) {
-			elapsed := int64(current.Sub(last))
-			// Saturate before multiplying: a long idle must never overflow or
-			// accumulate credit beyond the configured capacity.
-			if elapsed >= ceilDivide(level, config.Requests) {
-				level = 0
-			} else {
-				level -= elapsed * config.Requests
-			}
-			last = current
+		actor := auth.UserID(r.Context())
+		value, ok := buckets.Load(actor)
+		if !ok {
+			value, _ = buckets.LoadOrStore(actor, &leakyBucket{})
 		}
-		var retryAfter int64
-		if level <= admissionThreshold {
-			level += cost
-		} else {
-			retryAfter = ceilDivide(level-admissionThreshold, config.Requests)
-		}
-		mu.Unlock()
-
+		retryAfter := value.(*leakyBucket).admit(config, now)
 		if retryAfter > 0 {
 			seconds := ceilDivide(retryAfter, int64(time.Second))
 			w.Header().Set("Retry-After", strconv.FormatInt(seconds, 10))
@@ -107,6 +91,44 @@ func rateLimit(next http.Handler, config RateLimitConfig, now func() time.Time) 
 		}
 		next.ServeHTTP(w, r)
 	}), nil
+}
+
+type leakyBucket struct {
+	mu          sync.Mutex
+	level       int64
+	last        time.Time
+	initialized bool
+}
+
+// admit returns zero on admission, or nanoseconds until another request fits.
+func (b *leakyBucket) admit(config RateLimitConfig, now func() time.Time) int64 {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	current := now()
+	if !b.initialized {
+		b.last, b.initialized = current, true
+	}
+	// Lazy draining avoids a background ticker. Never move last backwards.
+	if current.After(b.last) {
+		elapsed := int64(current.Sub(b.last))
+		// Saturate before multiplying: long idle cannot overflow or accumulate
+		// credit beyond the configured capacity.
+		if elapsed >= ceilDivide(b.level, config.Requests) {
+			b.level = 0
+		} else {
+			b.level -= elapsed * config.Requests
+		}
+		b.last = current
+	}
+	// One admission adds Period nanoseconds of work; each elapsed nanosecond
+	// drains Requests units, retaining fractional rates such as three/second.
+	cost := int64(config.Period)
+	threshold := cost*config.Capacity - cost
+	if b.level > threshold {
+		return ceilDivide(b.level-threshold, config.Requests)
+	}
+	b.level += cost
+	return 0
 }
 
 // ceilDivide rounds nonnegative n up without overflowing n+d-1. d is positive.

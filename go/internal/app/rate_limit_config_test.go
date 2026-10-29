@@ -41,6 +41,10 @@ func TestRateLimitConfigurationValidation(t *testing.T) {
 			if (err == nil) != scenario.valid || (handler != nil) != scenario.valid {
 				t.Fatalf("constructor handler=%v error=%v, want valid=%v", handler, err, scenario.valid)
 			}
+			handler, err = NewRateLimitedRouter(nil, Options{}, scenario.config)
+			if (err == nil) != scenario.valid || (handler != nil) != scenario.valid {
+				t.Fatalf("composed constructor handler=%v error=%v, want valid=%v", handler, err, scenario.valid)
+			}
 		})
 	}
 	if got := DefaultRateLimitConfig(); got != (RateLimitConfig{10, time.Minute, 1}) {

@@ -15,8 +15,8 @@ import (
 	"github.com/weave-lab/interview-public/go/internal/store"
 )
 
-// BDD scenarios use the real router, SQLite and files. Wrappers let limiter
-// scenarios inject time without changing the production implementation.
+// BDD scenarios use the real router, SQLite and files. Limiter scenarios use
+// the production composition with injected time; other wrappers inject faults.
 type bddWorld struct {
 	store  *store.Store
 	client *http.Client
@@ -34,6 +34,32 @@ type bddResponse struct {
 
 func givenBDDApp(t *testing.T, wrappers ...func(http.Handler) http.Handler) *bddWorld {
 	t.Helper()
+	actors, err := auth.ParseActors(auth.DefaultActors)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return givenBDDActorsApp(t, actors, func(s *store.Store, opts Options) http.Handler {
+		handler := NewRouter(s, opts)
+		for _, wrap := range wrappers {
+			handler = wrap(handler)
+		}
+		return handler
+	})
+}
+
+func givenBDDRateLimitedApp(t *testing.T, actors []string, config RateLimitConfig, now func() time.Time) *bddWorld {
+	t.Helper()
+	return givenBDDActorsApp(t, actors, func(s *store.Store, opts Options) http.Handler {
+		handler, err := newRateLimitedRouter(s, opts, config, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return handler
+	})
+}
+
+func givenBDDActorsApp(t *testing.T, actors []string, build func(*store.Store, Options) http.Handler) *bddWorld {
+	t.Helper()
 	s, err := store.New(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -43,10 +69,6 @@ func givenBDDApp(t *testing.T, wrappers ...func(http.Handler) http.Handler) *bdd
 			t.Errorf("close scenario store: %v", err)
 		}
 	})
-	actors, err := auth.ParseActors(auth.DefaultActors)
-	if err != nil {
-		t.Fatal(err)
-	}
 	if err := s.RegisterActors(t.Context(), actors); err != nil {
 		t.Fatal(err)
 	}
@@ -58,11 +80,7 @@ func givenBDDApp(t *testing.T, wrappers ...func(http.Handler) http.Handler) *bdd
 	for token, actor := range credentials {
 		tokens[actor] = token
 	}
-	handler := NewRouter(s, Options{AuthTokens: credentials})
-	for _, wrap := range wrappers {
-		handler = wrap(handler)
-	}
-	server := httptest.NewServer(handler)
+	server := httptest.NewServer(build(s, Options{AuthTokens: credentials}))
 	t.Cleanup(server.Close)
 	client := server.Client()
 	client.Timeout = 5 * time.Second

@@ -1,6 +1,6 @@
 # Change rationale and scope
 
-- **Baseline:** starter `d35ce33`; prior behavior reviewed through `12b4e29`, followed by the explicitly requested limiter configuration change below.
+- **Baseline:** starter `d35ce33`; prior behavior reviewed through `12b4e29`, followed by the explicitly requested limiter configuration and actor-isolation changes below.
 - **A — assignment:** run locally; readable, maintainable, process-global leaky bucket at 10 requests/minute.
 - **S — direct support:** wiring, failure handling and focused verification needed for a reliable limiter submission.
 - **E — expansion:** later requests for modernization, strict full-app fixes, actors/isolation, separate health, BDD/API testing, regression review and configurable limiting. Specific policies below are our choices unless explicitly identified as requested.
@@ -8,15 +8,15 @@
 
 ## Original limiter and direct support
 
-- **A · Global budget:** one limiter instance around the business router; defaults to the shared 10/minute requirement without per-client or external state.
+- **A → E · Budget scope:** the assignment originally used one shared 10/minute bucket. The later explicit actor-isolation request replaces that scope with one process-local bucket per authenticated actor, retaining the same policy defaults. Clients for one actor share its allowance; aggregate admissions grow with active actor count.
 - **A, choice · Default capacity-one policing:** first admission immediate, then six-second spacing; conservative default burst policy. Lazy elapsed-time draining needs no ticker, queue or worker; idle time cannot accumulate more than configured capacity.
 - **E · Configurable policy:** explicitly requested count, period and capacity flags retain defaults of 10/minute and one. The interval derives from period/count, avoiding contradictory settings; larger capacity deliberately permits bursts rather than enforcing a strict count per window.
 - **E, choice · Exact bounded arithmetic:** scaled integer work preserves fractional drain rates without floating-point or interval-truncation drift. Validate positive values, nanosecond resolution and arithmetic bounds before opening resources; invalid explicit settings fail instead of falling back. Settings are startup-only, not environment/config-file or hot-reload controls.
 - **E · Actionable CLI failures:** explicitly requested flag/value-specific errors, safe numeric bounds and corrective guidance; multiple invalid basic values report together, then valid values receive relationship checks. One stderr diagnostic replaces duplicated stdout/usage output; help remains stdout/exit 0 and failures exit 1. Constructor validation and real entry-point subprocess tests keep the contract aligned.
-- **A, choice · Overflow and scope:** immediate JSON `429`, ceiling `Retry-After`, no-store; rejected attempts add no work. Charging before auth/routing keeps one rule for all business outcomes, but unauthenticated clients can consume the shared allowance.
-- **S · Synchronization:** mutex protects clock/drain/admit, never downstream handlers; prevents double admission without serializing handlers. Backward clocks cannot add credit; production uses `time.Now`.
-- **S · Wiring and logging:** wrap production once, keep `NewRouter` independently reusable, move logging outside the limiter; enforces the budget and logs rejections without throttling handler benchmarks.
-- **S/E · Focused tests:** injected time, exact boundaries, retry rounding, concurrent consumers, busy handlers and real SQLite write suppression cover the original rule; varied settings, burst/refill and CLI validation/wiring cover the requested configuration expansion without sleeping through minutes.
+- **A/E, choice · Overflow and scope:** immediate JSON `429`, ceiling per-bucket `Retry-After`, no-store; rejected attempts add no work. Parse credentials before limiting, then charge the selected bucket for all routing/handler outcomes. Missing/invalid credentials share a separate anonymous bucket and cannot consume authenticated actors' allowances.
+- **S/E · Synchronization:** a concurrent keyed map lazily creates actor buckets; each has its own mutex protecting clock/drain/admit, never downstream handlers. Same-actor races cannot exceed capacity, while actors have independent state. Backward clocks cannot add credit; production uses `time.Now`. Static credentials bound possible actor keys; no eviction or background worker is needed.
+- **S/E · Wiring and logging:** construct `NewRateLimitedRouter` once for production, ensuring authentication precedes admission; keep `NewRouter` independently reusable and logging outside the limiter. The standalone limiter requires authenticated context upstream. This enforces actor budgets and logs rejections without throttling handler benchmarks.
+- **S/E · Focused tests:** injected time, exact boundaries, retry rounding, concurrent consumers, busy handlers and real SQLite write suppression cover the algorithm. Extended HTTP/CLI BDD verifies per-actor admissions/audits, independently staggered refill, anonymous abuse isolation, 128 registered actors, custom burst/fractional drain and health exemption without sleeping through minutes.
 - **S/E · Failed responses:** check writes and abort interrupted responses with `http.ErrAbortHandler`; avoids reporting a partial body as complete. Limiter handling is direct support; JSON/CSV/download/health handling belongs to broader cleanup.
 
 Evidence: [limiter](internal/app/rate_limit.go), [wiring](cmd/server/main.go), [focused tests](internal/app/rate_limit_test.go).
@@ -25,7 +25,8 @@ Evidence: [limiter](internal/app/rate_limit.go), [wiring](cmd/server/main.go), [
 
 - **E · Distinct actors:** explicitly requested persisted attribution and private contacts/files; configured case-sensitive actor labels replace the earlier single `local-demo` identity. Labels are not verified email identities.
 - **E, choice · Ephemeral credentials:** independent random 256-bit tokens, memory-only, printed after both binds, rotated on restart; avoids spoofable email bearers without adding an identity provider or stored secrets. The local operator sees all tokens.
-- **E, choice · Auth boundaries:** snapshot token mappings, constant-time token comparison, duplicate-header rejection, fail-closed configuration and Bearer challenges; avoids ambiguous/mutable credential state. The auth endpoint verifies identity; it does not issue tokens.
+- **E · Unbounded actor count:** explicitly remove the former 64-actor maximum from configured registration and credential parsing; label validation and uniqueness remain. Startup registration has no fixed application count cap; credentials and active bucket memory grow with actor count. No runtime registration endpoint is added.
+- **E, choice · Auth boundaries:** snapshot SHA-256 credential-digest mappings provide keyed lookup without scanning actors. Duplicate-header rejection, fail-closed configuration and Bearer challenges avoid ambiguous/mutable identity. Map lookup is not guaranteed constant-time. The auth endpoint verifies identity; it does not issue tokens.
 - **E · Ownership end to end:** server-derived `owner_id`, actor foreign keys and filtering on CRUD/list/import/export/file/download paths; fulfills isolation. Foreign valid IDs return the same missing-resource response; no client-supplied owner is trusted.
 - **E, choice · Private reports:** filter aggregates by actor; prevents reports from exposing another actor's activity. This supports requested isolation but removes the starter's shared report view; no admin-report API was added.
 - **E, choice · Legacy refusal:** inspect existing schema/integrity read-only and refuse unsupported databases; ownership cannot be reliably inferred from incomplete/synthetic audit history. No first-caller adoption or automatic migration; fresh data or explicit offline migration is required.
@@ -52,7 +53,7 @@ Evidence: [request validation](internal/api/requests.go), [contacts/CSV](interna
 
 ## Expanded health, startup and lifecycle
 
-- **E · Separate health server:** explicitly requested API port + 1 default; independent liveness remains available when the business bucket is full. Health has no business routes, and the API listener has no health route; exemption is the supporting liveness policy.
+- **E · Separate health server:** explicitly requested API port + 1 default; independent liveness remains available when actor and anonymous buckets are full. Health has no business routes, and the API listener has no health route; exemption is the supporting liveness policy.
 - **E · Address/bind handling:** health override, IPv4/IPv6, independent ephemeral ports by default for API port 0, overflow/collision checks and partial-bind cleanup; makes the new two-listener feature usable. Both bind before credentials are printed.
 - **E, choice · Loopback and deadlines:** numeric loopback only, 5s headers, 30s read/write/request, 60s idle and 16 KiB headers; limits unintended exposure and resource occupation. LAN/hostname binds and sufficiently slow transfers are no longer supported.
 - **E · Coordinated shutdown:** returning startup helpers, signal context, five-second grace then cancellation/forced close, error propagation and joined server loops; avoids abrupt exits/ignored failures and releases shared storage afterward. Arbitrary handlers/readers still must cooperate.

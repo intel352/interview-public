@@ -9,6 +9,9 @@ The original prework requested the global leaky bucket. This branch also include
 later requested work; [scope and rationale](go/SCOPE.md) separates the assignment,
 its supporting tests, and the expanded hardening, ownership and health features.
 
+Planned production work, including bucket eviction and the open tenancy/organization
+model decision, is tracked in the [productionization roadmap](docs/PRODUCTIONIZATION.md).
+
 ## Quick Start
 
 Requires Go **1.27.3** or newer (`go version`).
@@ -41,6 +44,12 @@ At startup, the server prints an independent random bearer token for each actor
 go run ./cmd/server --actors=alice@example.com,bob@example.com
 ```
 
+Actor registration has no fixed count maximum. Configure at least one unique
+label; each label may contain up to 254 UTF-8 bytes without whitespace, commas
+or control characters. Registration remains startup-configured, and resource
+usage grows with the configured actors. Authentication uses an immutable map
+keyed by credential digests, avoiding a scan through every actor.
+
 Labels are case-sensitive local configuration, not verified email identities.
 Copy one actor's token from the private startup terminal:
 
@@ -64,16 +73,22 @@ Keep the old directory intact and use a fresh `--data` directory. See the
 
 ## Request limiting
 
-The Go server applies one **process-local leaky bucket** shared by every client
-on the business listener, including unauthenticated, unknown-route and failed requests. The separate health listener bypasses this limiter.
-The defaults remain **10 requests per minute, capacity one**: one admission every
-six seconds.
+The Go server applies an independent **process-local leaky bucket per
+authenticated actor** on the business listener. The defaults are **10 requests
+per minute, capacity one, per actor**: one admission every six seconds for each
+actor. Alice exhausting her allowance does not consume Bob's allowance. Clients
+and credentials for the same actor share that actor's bucket.
+
+Missing, malformed and invalid credentials share one separate anonymous bucket
+with the same configured policy. They cannot consume authenticated actors'
+allowances. Unknown-route and failed requests charge the selected bucket. The
+separate health listener bypasses all of these buckets.
 
 Runtime settings (command-line flags only; restart to change them):
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--rate-limit-requests` | `10` | Positive whole requests drained per period |
+| `--rate-limit-requests` | `10` | Positive whole requests drained per period in each bucket |
 | `--rate-limit-period` | `1m` | Positive Go duration, such as `1s`, `500ms` or `2m` |
 | `--rate-limit-capacity` | `1` | Positive whole requests the bucket can hold; maximum immediate burst when empty |
 
@@ -83,8 +98,8 @@ For example, from `go/`:
 go run ./cmd/server --rate-limit-requests=3 --rate-limit-period=1s --rate-limit-capacity=2
 ```
 
-This allows two immediate admissions when empty, then drains at three requests
-per second. The interval is derived from period/count, not a separate setting.
+This allows each actor two immediate admissions when its bucket is empty, then
+drains that bucket at three requests per second. The interval is derived from period/count, not a separate setting.
 Fractional intervals such as one third of a second retain their rational drain
 rate; admission is evaluated at nanosecond clock resolution. Capacity greater
 than one permits bursts, so the configured count is not a strict request ceiling
@@ -108,7 +123,7 @@ Malformed flag syntax stops at its first parsing error and points to `--help`.
 
 Assumptions and behavior:
 
-- **Default capacity: one request.** The first request passes immediately. Another
+- **Default capacity: one request per actor.** An actor's first request passes immediately. Another
   can pass exactly six seconds later. With larger capacity, idle time can empty
   the bucket but never allow more than the configured capacity in an immediate burst.
 - **Overflow: reject immediately.** A full bucket returns `429 Too Many Requests`,
@@ -116,26 +131,34 @@ Assumptions and behavior:
   requests are queued or delayed. This is leaky-bucket policing, not a queued
   traffic shaper.
 - `Retry-After` is the time until one more request fits, rounded up to whole seconds. It is
-  advisory: another client may take the next available slot. Rejected requests
+  advisory: another client using the same actor may take its next available slot. Rejected requests
   add no work and do not postpone the next admission.
-- Limiting runs before routing and authentication, so `429` takes precedence
-  while the bucket is full. Health probes on the separate health listener remain available and never consume the API allowance.
+- Credentials are parsed before bucket selection; limiting then runs before
+  routing and authorization. A full actor or anonymous bucket returns `429`.
+  An admitted anonymous request retains the route's usual `401` or `404`
+  response. Health probes remain available on their separate listener.
 
 The bucket stores scaled integer work: an admission adds `period-in-nanoseconds`
 units, and each elapsed nanosecond drains `requests` units, down to zero. This
-avoids floating-point error and rounding each interval. A mutex makes draining
-and admission atomic across clients. The clock is read under that lock, and
-handlers execute after it is released. Production uses Go's monotonic clock
+avoids floating-point error and rounding each interval. A concurrent keyed map
+creates each actor's bucket on first use. Each bucket has its own mutex, making
+drain and admission atomic for that actor. The clock is read under that lock,
+and handlers execute after it is released. Production uses Go's monotonic clock
 through `time.Now`; tests inject time so boundaries do not need sleeps. No
 background worker or new dependency is needed.
 
 This limits admissions, not simultaneous in-flight work: slow handlers can
-overlap. There is no per-client fairness, state resets on restart, and separate
-server processes have independent limits. A larger burst capacity changes
-the default strict spacing policy; per-client or distributed limits would require a
-different state scope. The server creates the wrapper once in `cmd/server`;
-`NewRouter` remains reusable without limiting so the existing benchmarks continue
-to measure CRM handlers.
+overlap, and CPU and storage remain shared. Clients within one actor compete for
+that actor's slots. Aggregate admitted traffic grows with the number of active
+actors. Credential state scales with configured actors; bucket state scales with
+actors that make requests, plus one anonymous entry. Invalid tokens do not
+create additional entries. Static startup credentials make eviction unnecessary.
+State resets on restart, and separate server processes have independent limits.
+
+The server constructs `NewRateLimitedRouter` once in `cmd/server`, ensuring
+authentication precedes actor-bucket selection. The standalone `RateLimit`
+wrapper requires authenticated context upstream. `NewRouter` remains reusable
+without limiting so existing benchmarks continue to measure CRM handlers.
 
 Run the tests from `go/`:
 
@@ -147,8 +170,10 @@ go vet ./...
 
 Coverage includes default six-second boundaries, varied rates and capacities,
 fractional drain and `Retry-After` rounding, invalid configuration, idle and
-backward-clock behavior, concurrent authenticated actors sharing one bucket,
-health isolation, and rejected writes leaving the real SQLite store unchanged.
+backward-clock behavior, concurrent clients sharing only their actor's bucket,
+independent actor refills, anonymous abuse isolation, 128 registered actors
+through HTTP and actual CLI startup, health isolation, and rejected writes
+leaving the real SQLite store unchanged.
 
 ## Endpoints
 
@@ -215,7 +240,7 @@ are arrays; the final page omits `next_page_token`.
 
 ## Examples
 
-Use the startup `TOKEN` above. With default limiter settings, leave at least six seconds between requests, or honor `Retry-After`. JSON mutations require `Content-Type: application/json`. Send only the five writable contact fields shown below; `PUT` replaces omitted fields with empty strings. Metadata such as `id`, `owner_id` and timestamps is read-only. [API testing](go/API_TESTING.md) includes a safe read-modify-write example.
+Use the startup `TOKEN` above. With default limiter settings, leave at least six seconds between requests for the same actor, or honor `Retry-After`. JSON mutations require `Content-Type: application/json`. Send only the five writable contact fields shown below; `PUT` replaces omitted fields with empty strings. Metadata such as `id`, `owner_id` and timestamps is read-only. [API testing](go/API_TESTING.md) includes a safe read-modify-write example.
 
 ```bash
 # List contacts (first page)
@@ -276,7 +301,7 @@ make bench
 |------|---------|-------------|
 | `--addr` | `127.0.0.1:8080` | Numeric loopback address only (IPv4 or IPv6) |
 | `--health-addr` | API port + 1 | Separate numeric loopback liveness address; API port `0` uses a second ephemeral port |
-| `--actors` | `alice@example.com,bob@example.com` | 1–64 case-sensitive actor labels; independent ephemeral credentials |
+| `--actors` | `alice@example.com,bob@example.com` | One or more unique actor labels, no fixed count maximum; independent ephemeral credentials |
 | `--data` | `data` | Actor-owned database and files; legacy shared schemas rejected |
 | `--seed` | `false` | Seed database with test data |
 | `--contacts` | `10000` | Number of contacts to seed |

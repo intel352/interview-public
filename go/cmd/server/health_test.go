@@ -527,7 +527,7 @@ func TestBDDRestartChangesCredentialAndKeepsData(t *testing.T) {
 	}
 	demoRequest(t, client, http.MethodGet, healthURL+"/health", "", http.StatusOK)
 	stop()
-	// A further real restart resets the global allowance without sleeps. Its
+	// A further real restart resets actor and anonymous allowances without sleeps. Its
 	// first request proves a previously valid token is rejected by auth itself,
 	// rather than merely receiving 429 from an already full limiter.
 	apiURL, _, _, stop = givenRunningDemo(t, data)
