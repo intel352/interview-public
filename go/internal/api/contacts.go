@@ -5,8 +5,11 @@ import (
 	"encoding/csv"
 	"encoding/json"
 	"errors"
+	"log"
 	"net/http"
 	"strconv"
+	"strings"
+	"unicode"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
@@ -21,11 +24,15 @@ type listContactsResponse struct {
 }
 
 func (a *API) HandleListContacts(w http.ResponseWriter, r *http.Request) {
+	actor := auth.UserID(r.Context())
 	limit := 50
 	if v := r.URL.Query().Get("limit"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 100 {
-			limit = n
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 || n > 100 {
+			writeError(w, http.StatusBadRequest, "limit must be between 1 and 100")
+			return
 		}
+		limit = n
 	}
 
 	var cursor *store.PageToken
@@ -37,7 +44,11 @@ func (a *API) HandleListContacts(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	contacts, err := a.store.ListContacts(r.Context(), limit+1, cursor)
+	contacts, err := a.store.ListContacts(r.Context(), actor, limit+1, cursor)
+	if errors.Is(err, store.ErrInvalidPageToken) {
+		writeError(w, http.StatusBadRequest, "invalid page token")
+		return
+	}
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to list contacts")
 		return
@@ -46,10 +57,15 @@ func (a *API) HandleListContacts(w http.ResponseWriter, r *http.Request) {
 	var nextToken string
 	if len(contacts) > limit {
 		last := contacts[limit-1]
-		nextToken = encodePageToken(&store.PageToken{
+		nextToken, err = encodePageToken(&store.PageToken{
+			OwnerID:   actor,
 			CreatedAt: last.CreatedAt,
 			ID:        last.ID,
 		})
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to encode page token")
+			return
+		}
 		contacts = contacts[:limit]
 	}
 
@@ -59,12 +75,18 @@ func (a *API) HandleListContacts(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func encodePageToken(t *store.PageToken) string {
-	data, _ := json.Marshal(t)
-	return base64.RawURLEncoding.EncodeToString(data)
+func encodePageToken(t *store.PageToken) (string, error) {
+	data, err := json.Marshal(t)
+	if err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(data), nil
 }
 
 func decodePageToken(s string) *store.PageToken {
+	if len(s) > 2048 {
+		return nil
+	}
 	data, err := base64.RawURLEncoding.DecodeString(s)
 	if err != nil {
 		return nil
@@ -73,7 +95,7 @@ func decodePageToken(s string) *store.PageToken {
 	if err := json.Unmarshal(data, &t); err != nil {
 		return nil
 	}
-	if t.CreatedAt.IsZero() || t.ID == "" {
+	if t.CreatedAt.IsZero() || t.ID == "" || len(t.ID) > 128 || t.OwnerID == "" {
 		return nil
 	}
 	return &t
@@ -82,7 +104,7 @@ func decodePageToken(s string) *store.PageToken {
 func (a *API) HandleGetContact(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 
-	contact, err := a.store.GetContact(r.Context(), id)
+	contact, err := a.store.GetContact(r.Context(), auth.UserID(r.Context()), id)
 	if errors.Is(err, store.ErrNotFound) {
 		writeError(w, http.StatusNotFound, "contact not found")
 		return
@@ -96,33 +118,30 @@ func (a *API) HandleGetContact(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) HandleCreateContact(w http.ResponseWriter, r *http.Request) {
-	var c store.Contact
-	if err := json.NewDecoder(r.Body).Decode(&c); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON")
+	c, ok := decodeContact(w, r)
+	if !ok {
 		return
 	}
 
 	c.ID = uuid.NewString()
-	if err := a.store.CreateContact(r.Context(), &c); err != nil {
+	if err := a.store.CreateContact(r.Context(), auth.UserID(r.Context()), &c); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to create contact")
 		return
 	}
 
-	a.store.LogActivity(r.Context(), auth.UserID(r.Context()), "create", "contact", c.ID)
 	writeJSON(w, http.StatusCreated, c)
 }
 
 func (a *API) HandleUpdateContact(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 
-	var c store.Contact
-	if err := json.NewDecoder(r.Body).Decode(&c); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON")
+	c, ok := decodeContact(w, r)
+	if !ok {
 		return
 	}
 
 	c.ID = id
-	if err := a.store.UpdateContact(r.Context(), &c); err != nil {
+	if err := a.store.UpdateContact(r.Context(), auth.UserID(r.Context()), &c); err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			writeError(w, http.StatusNotFound, "contact not found")
 			return
@@ -131,14 +150,13 @@ func (a *API) HandleUpdateContact(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	a.store.LogActivity(r.Context(), auth.UserID(r.Context()), "update", "contact", c.ID)
 	writeJSON(w, http.StatusOK, c)
 }
 
 func (a *API) HandleDeleteContact(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 
-	if err := a.store.DeleteContact(r.Context(), id); err != nil {
+	if err := a.store.DeleteContact(r.Context(), auth.UserID(r.Context()), id); err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			writeError(w, http.StatusNotFound, "contact not found")
 			return
@@ -147,19 +165,12 @@ func (a *API) HandleDeleteContact(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	a.store.LogActivity(r.Context(), auth.UserID(r.Context()), "delete", "contact", id)
 	w.WriteHeader(http.StatusNoContent)
 }
 
 func (a *API) HandleImportContacts(w http.ResponseWriter, r *http.Request) {
-	var contacts []store.Contact
-	if err := json.NewDecoder(r.Body).Decode(&contacts); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON")
-		return
-	}
-
-	if len(contacts) > 10000 {
-		writeError(w, http.StatusBadRequest, "maximum 10000 contacts per import")
+	contacts, ok := decodeContactImport(w, r)
+	if !ok {
 		return
 	}
 
@@ -167,42 +178,72 @@ func (a *API) HandleImportContacts(w http.ResponseWriter, r *http.Request) {
 		contacts[i].ID = uuid.NewString()
 	}
 
-	imported, err := a.store.ImportContacts(r.Context(), contacts)
+	imported, err := a.store.ImportContacts(r.Context(), auth.UserID(r.Context()), contacts)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to import contacts")
 		return
 	}
 
-	a.store.LogActivity(r.Context(), auth.UserID(r.Context()), "import", "contacts", "")
 	writeJSON(w, http.StatusOK, map[string]int{"imported": imported})
 }
 
 func (a *API) HandleExportContacts(w http.ResponseWriter, r *http.Request) {
-	contacts, err := a.store.ExportContacts(r.Context())
+	contacts, err := a.store.ExportContacts(r.Context(), auth.UserID(r.Context()))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to export contacts")
+		return
+	}
+	// This records the attempt, not guaranteed delivery to a connected client.
+	if err := a.store.LogActivity(r.Context(), auth.UserID(r.Context()), "export", "contacts", ""); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to record export attempt")
 		return
 	}
 
 	w.Header().Set("Content-Type", "text/csv")
 	w.Header().Set("Content-Disposition", "attachment; filename=contacts.csv")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
 
 	cw := csv.NewWriter(w)
-	cw.Write([]string{"id", "first_name", "last_name", "email", "phone", "company", "created_at", "updated_at"})
+	if err := cw.Write([]string{"id", "first_name", "last_name", "email", "phone", "company", "created_at", "updated_at"}); err != nil {
+		log.Print("write CSV response failed")
+		panic(http.ErrAbortHandler)
+	}
 
 	for _, c := range contacts {
-		cw.Write([]string{
-			c.ID,
-			c.FirstName,
-			c.LastName,
-			c.Email,
-			c.Phone,
-			c.Company,
+		if err := cw.Write([]string{
+			spreadsheetCell(c.ID),
+			spreadsheetCell(c.FirstName),
+			spreadsheetCell(c.LastName),
+			spreadsheetCell(c.Email),
+			spreadsheetCell(c.Phone),
+			spreadsheetCell(c.Company),
 			c.CreatedAt.Format("2006-01-02T15:04:05Z"),
 			c.UpdatedAt.Format("2006-01-02T15:04:05Z"),
-		})
+		}); err != nil {
+			log.Print("write CSV response failed")
+			panic(http.ErrAbortHandler)
+		}
 	}
 	cw.Flush()
+	if err := cw.Error(); err != nil {
+		log.Print("flush CSV response failed")
+		panic(http.ErrAbortHandler)
+	}
+}
 
-	a.store.LogActivity(r.Context(), auth.UserID(r.Context()), "export", "contacts", "")
+// CSV quoting is not sufficient to prevent spreadsheet formula interpretation.
+// Prefix dangerous values with an apostrophe; do not change the stored value.
+func spreadsheetCell(value string) string {
+	trimmed := strings.TrimLeftFunc(value, func(r rune) bool { return unicode.IsSpace(r) || unicode.IsControl(r) })
+	if strings.HasPrefix(value, "\t") || strings.HasPrefix(value, "\r") || strings.HasPrefix(value, "\n") || strings.ContainsAny(firstByte(trimmed), "=+-@") {
+		return "'" + value
+	}
+	return value
+}
+
+func firstByte(value string) string {
+	if value == "" {
+		return ""
+	}
+	return value[:1]
 }

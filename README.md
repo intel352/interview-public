@@ -1,21 +1,24 @@
 # CRM API Server
 
-A simple CRM-style API server for managing contacts and files. Available in both Go and Java implementations with identical API interfaces.
+A Go CRM-style API server for managing contacts and files. The implementation
+lives in `go/` and provides actor-owned data, a separate health listener and
+strict validation. See [Go hardening](go/HARDENING.md),
+[API testing](go/API_TESTING.md) and [compatibility review](go/COMPATIBILITY.md).
 
-## Implementations
+The original prework requested the global leaky bucket. This branch also includes
+later requested work; [scope and rationale](go/SCOPE.md) separates the assignment,
+its supporting tests, and the expanded hardening, ownership and health features.
 
-- **Go**: Located in `go/` directory
-- **Java**: Located in `java/` directory (Spring Boot)
-
-Both implementations share the same SQLite database schema and provide identical REST API endpoints.
+Planned production work, including bucket eviction and the open tenancy/organization
+model decision, is tracked in the [productionization roadmap](docs/PRODUCTIONIZATION.md).
 
 ## Quick Start
 
-### Go
+Requires Go **1.27.3** or newer (`go version`).
 
 ```bash
 cd go
-make seed   # Seed the database with test data
+make seed   # Optional: seed actor-owned synthetic data
 make run    # Start the server
 ```
 
@@ -27,33 +30,162 @@ go run ./cmd/server --seed
 go run ./cmd/server
 ```
 
-### Java
-
-```bash
-cd java
-make seed   # Seed the database with test data
-make run    # Start the server
-```
-
-Or without make:
-
-```bash
-cd java
-./mvnw spring-boot:run -Dspring-boot.run.arguments="--app.seed=true"
-./mvnw spring-boot:run
-```
-
-The server runs on `http://localhost:8080` by default.
+The server exposes the business API at `http://127.0.0.1:8080` and public liveness at `http://127.0.0.1:8081/health`. Both accept only numeric loopback addresses. A fresh empty database is usable without seeding.
 
 ## Authentication
 
-All `/api/*` endpoints require a bearer token in the `Authorization` header:
+### Configured local actors
+
+At startup, the server prints an independent random bearer token for each actor
+**after both listeners bind**. The defaults are `alice@example.com` and
+`bob@example.com`. Configure explicit labels with, for example:
 
 ```bash
-curl -H "Authorization: Bearer user@example.com" http://localhost:8080/api/contacts
+go run ./cmd/server --actors=alice@example.com,bob@example.com
 ```
 
-The token should be a valid email address. It serves as the user identifier.
+Actor registration has no fixed count maximum. Configure at least one unique
+label; each label may contain up to 254 UTF-8 bytes without whitespace, commas
+or control characters. Registration remains startup-configured, and resource
+usage grows with the configured actors. Authentication uses an immutable map
+keyed by credential digests, avoiding a scan through every actor.
+
+Labels are case-sensitive local configuration, not verified email identities.
+Copy one actor's token from the private startup terminal:
+
+```bash
+read -r -s TOKEN   # Paste that actor's token, then press Enter
+curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/api/contacts
+```
+
+Each credential carries its actor into contact/file ownership and audit rows.
+Lists, individual resources, imports, exports, files and reports are restricted
+to that actor. Another actor's resource ID returns the same `404` as a missing ID.
+Tokens stay in memory, change on restart, and are absent from data/access logs.
+`POST /api/auth/token` returns the authenticated `user_id`; it does not issue tokens.
+Keep startup output private and run `unset TOKEN` when finished. An email label
+alone never authenticates. The local operator can see every startup credential;
+this is a local demonstration, not an external identity provider.
+
+Legacy shared databases are rejected without automatic ownership assignment.
+Keep the old directory intact and use a fresh `--data` directory. See the
+[compatibility and migration policy](go/COMPATIBILITY.md).
+
+## Request limiting
+
+The Go server applies an independent **process-local leaky bucket per
+authenticated actor** on the business listener. The defaults are **10 requests
+per minute, capacity one, per actor**: one admission every six seconds for each
+actor. Alice exhausting her allowance does not consume Bob's allowance. Clients
+and credentials for the same actor share that actor's bucket.
+
+Missing, malformed and invalid credentials share one separate anonymous bucket
+with the same configured policy. They cannot consume authenticated actors'
+allowances. Unknown-route and failed requests charge the selected bucket. The
+separate health listener bypasses all of these buckets.
+
+Runtime settings (command-line flags only; restart to change them):
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--rate-limit-requests` | `10` | Positive whole requests drained per period in each bucket |
+| `--rate-limit-period` | `1m` | Positive Go duration, such as `1s`, `500ms` or `2m` |
+| `--rate-limit-capacity` | `1` | Positive whole requests the bucket can hold; maximum immediate burst when empty |
+
+For example, from `go/`:
+
+```bash
+go run ./cmd/server --rate-limit-requests=3 --rate-limit-period=1s --rate-limit-capacity=2
+```
+
+This allows each actor two immediate admissions when its bucket is empty, then
+drains that bucket at three requests per second. The interval is derived from period/count, not a separate setting.
+Fractional intervals such as one third of a second retain their rational drain
+rate; admission is evaluated at nanosecond clock resolution. Capacity greater
+than one permits bursts, so the configured count is not a strict request ceiling
+for each fixed or rolling period.
+
+Rate and burst capacity are separate: with the default 10/minute drain rate,
+`--rate-limit-capacity=10` permits ten immediate admissions per actor, then one
+more after six seconds. The default capacity remains one.
+
+Invalid explicit settings fail startup before opening data/listeners or printing
+credentials. Count/capacity must fit signed 64-bit integers; the period must fit a Go
+duration. Period text that would lose fractional nanoseconds (such as `1.5ns`)
+is rejected; exact fractional durations such as `1.5s` work. Rates faster than
+one request per nanosecond and configurations whose
+`capacity × period-in-nanoseconds` exceeds `9223372036854775807` are rejected.
+Zero, negative, malformed and overflowing values never silently use defaults.
+There are no limiter environment variables, config files or hot reload.
+
+Invalid configuration exits with status `1`, writes the reason once to stderr,
+and leaves stdout empty. Diagnostics identify offending flags/values, supported
+bounds and corrective choices. Multiple invalid basic values are reported together;
+relationship checks run after those values are valid.
+Malformed flag syntax stops at its first parsing error and points to `--help`.
+`--help` (or `-h`) prints usage to stdout and exits `0` without opening resources.
+
+Assumptions and behavior:
+
+- **Default capacity: one request per actor.** An actor's first request passes immediately. Another
+  can pass exactly six seconds later. With larger capacity, idle time can empty
+  the bucket but never allow more than the configured capacity in an immediate burst.
+- **Overflow: reject immediately.** A full bucket returns `429 Too Many Requests`,
+  `Content-Type: application/json`, and `{"error":"rate limit exceeded"}`. No
+  requests are queued or delayed. This is leaky-bucket policing, not a queued
+  traffic shaper.
+- `Retry-After` is the time until one more request fits, rounded up to whole seconds. It is
+  advisory: another client using the same actor may take its next available slot. Rejected requests
+  add no work and do not postpone the next admission.
+- Credentials are parsed before bucket selection; limiting then runs before
+  routing and authorization. A full actor or anonymous bucket returns `429`.
+  An admitted anonymous request retains the route's usual `401` or `404`
+  response. Health probes remain available on their separate listener.
+
+The bucket stores scaled integer work: an admission adds `period-in-nanoseconds`
+units, and each elapsed nanosecond drains `requests` units, down to zero. This
+avoids floating-point error and rounding each interval. A concurrent keyed map
+creates each actor's bucket on first use. Each bucket has its own mutex, making
+drain and admission atomic for that actor. The clock is read under that lock,
+and handlers execute after it is released. Production uses Go's monotonic clock
+through `time.Now`; tests inject time so boundaries do not need sleeps. No
+background worker or new dependency is needed.
+
+This limits admissions, not simultaneous in-flight work: slow handlers can
+overlap, and CPU and storage remain shared. Clients within one actor compete for
+that actor's slots. Aggregate admitted traffic grows with the number of active
+actors. Credential state scales with configured actors; bucket state scales with
+actors that make requests, plus one anonymous entry. Invalid tokens do not
+create additional entries. Static startup credentials make eviction unnecessary.
+State resets on restart, and separate server processes have independent limits.
+
+The server constructs `NewRateLimitedRouter` once in `cmd/server`, ensuring
+authentication precedes actor-bucket selection. The standalone `RateLimit`
+wrapper requires authenticated context upstream. `NewRouter` remains reusable
+without limiting so existing benchmarks continue to measure CRM handlers.
+
+`RateLimitMiddleware(config)` validates a policy and returns
+`func(http.Handler) http.Handler` for `r.Use(...)` or endpoint-specific
+`r.With(...)` composition. Authenticate upstream. Reuse one middleware instance
+to share its actor budgets across handlers; construct another instance for an
+independent, stricter endpoint policy. When layers are stacked, an outer
+admission still consumes allowance if an inner policy rejects the request;
+there is no composite admission transaction or automatic refund.
+
+Run the tests from `go/`:
+
+```bash
+go test ./...
+go test -race ./...
+go vet ./...
+```
+
+Coverage includes default six-second boundaries, varied rates and capacities,
+fractional drain and `Retry-After` rounding, invalid configuration, idle and
+backward-clock behavior, concurrent clients sharing only their actor's bucket,
+independent actor refills, anonymous abuse isolation, 128 registered actors
+through HTTP and actual CLI startup, health isolation, and rejected writes
+leaving the real SQLite store unchanged.
 
 ## Endpoints
 
@@ -61,7 +193,13 @@ The token should be a valid email address. It serves as the user identifier.
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/health` | Health check (no auth required) |
+| `GET` | `/health` | Public liveness on the health listener only; no database readiness claim |
+
+### Authentication (business listener)
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/api/auth/token` | Verify the current actor credential |
 
 ### Contacts
 
@@ -73,21 +211,21 @@ The token should be a valid email address. It serves as the user identifier.
 | `PUT` | `/api/contacts/:id` | Update a contact |
 | `DELETE` | `/api/contacts/:id` | Delete a contact |
 | `POST` | `/api/contacts/import` | Bulk import contacts (JSON array, max 10k) |
-| `GET` | `/api/contacts/export` | Export all contacts as CSV |
+| `GET` | `/api/contacts/export` | Export this actor's contacts as spreadsheet-safe CSV |
 
 ### Files
 
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/api/files` | List files |
-| `POST` | `/api/files` | Upload a file (multipart form, max 100MB) |
+| `POST` | `/api/files` | Upload a file (multipart form, max 100 MiB file) |
 | `GET` | `/api/files/:id` | Download a file |
 
 ### Reports
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/api/reports/activity` | Activity report (last 30 days by default) |
+| `GET` | `/api/reports/activity` | This actor's report (last 30 UTC days by default; optional `since=YYYY-MM-DD`) |
 
 ## Pagination
 
@@ -103,66 +241,66 @@ The `/api/contacts` endpoint uses cursor-based pagination. The response includes
 Pass the token as a query parameter to fetch the next page:
 
 ```bash
-curl -H "Authorization: Bearer user@example.com" \
-  "http://localhost:8080/api/contacts?page_token=eyJjcmVhdGVkX2F0Ijoi..."
+curl -H "Authorization: Bearer $TOKEN" \
+  "http://127.0.0.1:8080/api/contacts?page_token=eyJjcmVhdGVkX2F0Ijoi..."
 ```
+
+Pagination is a live descending `(created_at, id)` walk, not a snapshot. A cursor
+is scoped to its actor, still works if its anchor is deleted, and omits new rows
+inserted before that position. Do not reuse another actor's cursor. Empty lists
+are arrays; the final page omits `next_page_token`.
 
 ## Examples
 
+Use the startup `TOKEN` above. With default limiter settings, leave at least six seconds between requests for the same actor, or honor `Retry-After`. JSON mutations require `Content-Type: application/json`. Send only the five writable contact fields shown below; `PUT` replaces omitted fields with empty strings. Metadata such as `id`, `owner_id` and timestamps is read-only. [API testing](go/API_TESTING.md) includes a safe read-modify-write example.
+
 ```bash
 # List contacts (first page)
-curl -H "Authorization: Bearer user@example.com" \
-  http://localhost:8080/api/contacts?limit=10
+curl -H "Authorization: Bearer $TOKEN" \
+  "http://127.0.0.1:8080/api/contacts?limit=10"
 
 # Create a contact
-curl -X POST -H "Authorization: Bearer user@example.com" \
+curl -X POST -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"first_name":"Jane","last_name":"Doe","email":"jane@example.com","phone":"555-1234","company":"Acme"}' \
-  http://localhost:8080/api/contacts
+  http://127.0.0.1:8080/api/contacts
 
 # Upload a file
-curl -X POST -H "Authorization: Bearer user@example.com" \
+curl -X POST -H "Authorization: Bearer $TOKEN" \
   -F "file=@/path/to/file.pdf" \
-  http://localhost:8080/api/files
+  http://127.0.0.1:8080/api/files
 
 # Bulk import
-curl -X POST -H "Authorization: Bearer user@example.com" \
+curl -X POST -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '[{"first_name":"A","last_name":"B","email":"a@b.com","phone":"555","company":"X"}]' \
-  http://localhost:8080/api/contacts/import
+  http://127.0.0.1:8080/api/contacts/import
 
 # Export contacts
-curl -H "Authorization: Bearer user@example.com" \
-  http://localhost:8080/api/contacts/export > contacts.csv
+curl -H "Authorization: Bearer $TOKEN" \
+  http://127.0.0.1:8080/api/contacts/export > contacts.csv
 ```
+
+CSV protects spreadsheet cells and may prefix values such as `+15551234` with an apostrophe. It is not a lossless backup. Use paginated JSON to obtain exact stored text and full timestamp precision.
 
 ## Seeding Options
 
-### Go
-
 ```bash
 cd go
-make seed                                      # Default: 10k contacts, 20 files
+make seed                                      # Default totals: 10k contacts, 20 files across configured actors
 go run ./cmd/server --seed --contacts=50000    # Custom contact count
 go run ./cmd/server --seed --files=100         # Custom file count
 ```
 
-### Java
-
-```bash
-cd java
-make seed                                                                              # Default: 10k contacts, 20 files
-./mvnw spring-boot:run -Dspring-boot.run.arguments="--app.seed=true --contacts=50000"  # Custom contact count
-```
+Seeding commits contacts, file metadata, activity and a completion marker together. A completed seed is a no-op on repetition; contact count is not an initialization marker. Zero-contact seeds and empty databases can serve normally. Ordinary failure/cancellation rolls back seed rows and cleans up owned files; retry is safe. Power-loss filesystem recovery is a separate limitation.
 
 To reset the database:
 
 ```bash
-cd go && make reset   # Go
-cd java && make reset # Java
+cd go && make reset
 ```
 
-## Benchmarks (Go only)
+## Benchmarks
 
 ```bash
 cd go
@@ -171,22 +309,16 @@ make bench
 
 ## Configuration
 
-### Go
-
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--addr` | `:8080` | Server listen address |
-| `--data` | `data` | Data directory for database and files |
+| `--addr` | `127.0.0.1:8080` | Numeric loopback address only (IPv4 or IPv6) |
+| `--health-addr` | API port + 1 | Separate numeric loopback liveness address; API port `0` uses a second ephemeral port |
+| `--actors` | `alice@example.com,bob@example.com` | One or more unique actor labels, no fixed count maximum; independent ephemeral credentials |
+| `--data` | `data` | Actor-owned database and files; legacy shared schemas rejected |
 | `--seed` | `false` | Seed database with test data |
 | `--contacts` | `10000` | Number of contacts to seed |
 | `--files` | `20` | Number of files to seed |
 
-### Java
+API port `65535` requires an explicit health address; colliding listeners fail startup before credential output. IPv6 loopback is supported, for example `--addr='[::1]:8080'`. Both listeners drain and close together on shutdown or server failure.
 
-Configuration is in `src/main/resources/application.properties`:
-
-| Property | Default | Description |
-|----------|---------|-------------|
-| `server.port` | `8080` | Server listen port |
-| `app.data-dir` | `data` | Data directory for database and files |
-| `app.max-upload-size` | `104857600` | Max file upload size (100MB) |
+Run `make test-api`, `make test-bdd` or `make test-race` from `go/` for isolated native API testing; no manually managed server or credentials are needed. The [coverage matrix](go/API_TESTING.md#coverage-matrix) names the scenarios and exclusions.

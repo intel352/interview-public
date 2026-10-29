@@ -2,6 +2,7 @@ package app
 
 import (
 	"net/http"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
@@ -13,21 +14,51 @@ import (
 
 type Options struct {
 	EnableLogging bool
+	AuthTokens    map[string]string // Ephemeral token to configured actor ID.
 }
 
 func NewRouter(s *store.Store, opts Options) http.Handler {
+	return newAuthenticatedRouter(s, opts, nil)
+}
+
+// NewRateLimitedRouter authenticates each request before selecting its actor's
+// bucket, then applies the same routing and authorization as NewRouter.
+func NewRateLimitedRouter(s *store.Store, opts Options, config RateLimitConfig) (http.Handler, error) {
+	limit, err := RateLimitMiddleware(config)
+	if err != nil {
+		return nil, err
+	}
+	return newAuthenticatedRouter(s, opts, limit), nil
+}
+
+func newRateLimitedRouter(s *store.Store, opts Options, config RateLimitConfig, now func() time.Time) (http.Handler, error) {
+	limit, err := rateLimitMiddleware(config, now)
+	if err != nil {
+		return nil, err
+	}
+	return newAuthenticatedRouter(s, opts, limit), nil
+}
+
+func newAuthenticatedRouter(s *store.Store, opts Options, limit func(http.Handler) http.Handler) http.Handler {
+	handler := newRouter(s)
+	if limit != nil {
+		handler = limit(handler)
+	}
+	return withRequestLogging(auth.TokenParser(opts.AuthTokens)(handler), opts.EnableLogging)
+}
+
+func withRequestLogging(handler http.Handler, enabled bool) http.Handler {
+	if enabled {
+		return middleware.Logger(handler)
+	}
+	return handler
+}
+
+func newRouter(s *store.Store) http.Handler {
 	a := api.New(s)
 	r := chi.NewRouter()
 
-	if opts.EnableLogging {
-		r.Use(middleware.Logger)
-	}
 	r.Use(middleware.Recoverer)
-	r.Use(auth.TokenParser)
-
-	r.Get("/health", func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("ok"))
-	})
 
 	r.Route("/api", func(r chi.Router) {
 		r.Use(auth.RequireAuth)

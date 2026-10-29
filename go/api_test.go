@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime/multipart"
@@ -11,8 +12,10 @@ import (
 	"net/http/httptest"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/weave-lab/interview-public/go/internal/app"
+	"github.com/weave-lab/interview-public/go/internal/auth"
 	"github.com/weave-lab/interview-public/go/internal/seed"
 	"github.com/weave-lab/interview-public/go/internal/store"
 )
@@ -20,126 +23,188 @@ import (
 var (
 	testServer *httptest.Server
 	testStore  *store.Store
+	testToken  string
 )
 
-func TestMain(m *testing.M) {
+func TestMain(m *testing.M) { os.Exit(runTests(m)) }
+
+func runTests(m *testing.M) (code int) {
 	dir, err := os.MkdirTemp("", "interview-test-*")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to create temp dir: %v\n", err)
-		os.Exit(1)
+		return 1
 	}
-	defer os.RemoveAll(dir)
-
+	defer func() {
+		if err := os.RemoveAll(dir); err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to remove test data: %v\n", err)
+			code = 1
+		}
+	}()
 	testStore, err = store.New(dir)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to create store: %v\n", err)
-		os.Exit(1)
+		return 1
 	}
-	defer testStore.Close()
-
-	opts := seed.Options{
-		Contacts: 1000,
-		Files:    5,
+	defer func() {
+		if err := testStore.Close(); err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to close store: %v\n", err)
+			code = 1
+		}
+	}()
+	testToken, err = auth.NewToken()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to create test token: %v\n", err)
+		return 1
 	}
 	seed.SetQuiet(true)
-	if err := seed.Run(context.Background(), testStore, opts); err != nil {
+	if err := seed.Run(context.Background(), testStore, seed.Options{Contacts: 1000, Files: 5, Actors: []string{"alice@example.com"}}); err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to seed: %v\n", err)
-		os.Exit(1)
+		return 1
 	}
-
-	r := app.NewRouter(testStore, app.Options{EnableLogging: false})
-	testServer = httptest.NewServer(r)
+	testServer = httptest.NewServer(app.NewRouter(testStore, app.Options{AuthTokens: map[string]string{testToken: "alice@example.com"}}))
 	defer testServer.Close()
-
-	os.Exit(m.Run())
+	return m.Run()
 }
 
-func authedRequest(method, path string, body io.Reader) *http.Request {
-	req, _ := http.NewRequest(method, testServer.URL+path, body)
-	req.Header.Set("Authorization", "Bearer test@example.com")
-	return req
-}
-
-// Serial benchmarks
-
-func BenchmarkListContacts(b *testing.B) {
-	client := &http.Client{}
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		req := authedRequest("GET", "/api/contacts?limit=50", nil)
-		resp, err := client.Do(req)
-		if err != nil {
-			b.Fatal(err)
-		}
-		io.Copy(io.Discard, resp.Body)
-		resp.Body.Close()
+func authedRequest(method, path string, body io.Reader) (*http.Request, error) {
+	req, err := http.NewRequest(method, testServer.URL+path, body)
+	if err != nil {
+		return nil, fmt.Errorf("create request: %w", err)
 	}
+	req.Header.Set("Authorization", "Bearer "+testToken)
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	return req, nil
 }
 
-func BenchmarkGetContact(b *testing.B) {
-	contacts, _ := testStore.ListContacts(context.Background(), 1, nil)
+func benchmarkRequest(client *http.Client, method, path string, body io.Reader, contentType string, wantStatus int) error {
+	req, err := authedRequest(method, path, body)
+	if err != nil {
+		return err
+	}
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("%s %s: %w", method, path, err)
+	}
+	_, readErr := io.Copy(io.Discard, resp.Body)
+	closeErr := resp.Body.Close()
+	var statusErr error
+	if resp.StatusCode != wantStatus {
+		statusErr = fmt.Errorf("%s %s: status %d, want %d", method, path, resp.StatusCode, wantStatus)
+	}
+	return errors.Join(statusErr, readErr, closeErr)
+}
+
+func benchmarkClient(b *testing.B) *http.Client {
+	b.Helper()
+	client := testServer.Client()
+	client.Timeout = 30 * time.Second
+	b.Cleanup(client.CloseIdleConnections)
+	return client
+}
+
+func benchmarkContactID(b *testing.B) string {
+	b.Helper()
+	contacts, err := testStore.ListContacts(context.Background(), "alice@example.com", 1, nil)
+	if err != nil {
+		b.Fatal(err)
+	}
 	if len(contacts) == 0 {
 		b.Fatal("no contacts")
 	}
-	id := contacts[0].ID
+	return contacts[0].ID
+}
 
-	client := &http.Client{}
+func benchmarkFileID(b *testing.B) string {
+	b.Helper()
+	files, err := testStore.ListFiles(context.Background(), "alice@example.com")
+	if err != nil {
+		b.Fatal(err)
+	}
+	if len(files) == 0 {
+		b.Fatal("no files")
+	}
+	return files[0].ID
+}
 
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		req := authedRequest("GET", "/api/contacts/"+id, nil)
-		resp, err := client.Do(req)
-		if err != nil {
+func benchmarkGET(b *testing.B, path string) {
+	b.Helper()
+	client := benchmarkClient(b)
+	for b.Loop() {
+		if err := benchmarkRequest(client, http.MethodGet, path, nil, "", http.StatusOK); err != nil {
 			b.Fatal(err)
 		}
-		io.Copy(io.Discard, resp.Body)
-		resp.Body.Close()
 	}
 }
+
+func benchmarkGETParallel(b *testing.B, path string) {
+	b.Helper()
+	client := benchmarkClient(b)
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			if err := benchmarkRequest(client, http.MethodGet, path, nil, "", http.StatusOK); err != nil {
+				b.Error(err)
+				return
+			}
+		}
+	})
+}
+
+func BenchmarkListContacts(b *testing.B) { benchmarkGET(b, "/api/contacts?limit=50") }
+
+func BenchmarkListContactsParallel(b *testing.B) { benchmarkGETParallel(b, "/api/contacts?limit=50") }
+
+func BenchmarkGetContact(b *testing.B) { benchmarkGET(b, "/api/contacts/"+benchmarkContactID(b)) }
+
+func BenchmarkGetContactParallel(b *testing.B) {
+	benchmarkGETParallel(b, "/api/contacts/"+benchmarkContactID(b))
+}
+
+func BenchmarkExportContacts(b *testing.B) { benchmarkGET(b, "/api/contacts/export") }
+
+func BenchmarkExportContactsParallel(b *testing.B) { benchmarkGETParallel(b, "/api/contacts/export") }
+
+func BenchmarkDownloadFile(b *testing.B) { benchmarkGET(b, "/api/files/"+benchmarkFileID(b)) }
+
+func BenchmarkDownloadFileParallel(b *testing.B) {
+	benchmarkGETParallel(b, "/api/files/"+benchmarkFileID(b))
+}
+
+func BenchmarkActivityReport(b *testing.B) { benchmarkGET(b, "/api/reports/activity") }
+
+func BenchmarkActivityReportParallel(b *testing.B) { benchmarkGETParallel(b, "/api/reports/activity") }
+
+const benchmarkContact = `{"first_name":"Test","last_name":"User","email":"test@example.com","phone":"555-1234","company":"Test Corp"}`
 
 func BenchmarkCreateContact(b *testing.B) {
-	client := &http.Client{}
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		body := bytes.NewBufferString(`{
-			"first_name": "Test",
-			"last_name": "User",
-			"email": "test@example.com",
-			"phone": "555-1234",
-			"company": "Test Corp"
-		}`)
-		req := authedRequest("POST", "/api/contacts", body)
-		req.Header.Set("Content-Type", "application/json")
-
-		resp, err := client.Do(req)
-		if err != nil {
+	client := benchmarkClient(b)
+	for b.Loop() {
+		if err := benchmarkRequest(client, http.MethodPost, "/api/contacts", bytes.NewBufferString(benchmarkContact), "", http.StatusCreated); err != nil {
 			b.Fatal(err)
 		}
-		io.Copy(io.Discard, resp.Body)
-		resp.Body.Close()
 	}
 }
 
-func BenchmarkExportContacts(b *testing.B) {
-	client := &http.Client{}
-
+func BenchmarkCreateContactParallel(b *testing.B) {
+	client := benchmarkClient(b)
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		req := authedRequest("GET", "/api/contacts/export", nil)
-		resp, err := client.Do(req)
-		if err != nil {
-			b.Fatal(err)
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			if err := benchmarkRequest(client, http.MethodPost, "/api/contacts", bytes.NewBufferString(benchmarkContact), "", http.StatusCreated); err != nil {
+				b.Error(err)
+				return
+			}
 		}
-		io.Copy(io.Discard, resp.Body)
-		resp.Body.Close()
-	}
+	})
 }
 
 func BenchmarkImportContacts(b *testing.B) {
-	client := &http.Client{}
-
+	client := benchmarkClient(b)
 	contacts := make([]map[string]string, 100)
 	for i := range contacts {
 		contacts[i] = map[string]string{
@@ -147,194 +212,38 @@ func BenchmarkImportContacts(b *testing.B) {
 			"last_name":  "Test",
 			"email":      fmt.Sprintf("import%d@test.com", i),
 			"phone":      "555-0000",
-			"company":    "Import Corp",
+			"company":    "Test Corp",
 		}
 	}
-	payload, _ := json.Marshal(contacts)
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		req := authedRequest("POST", "/api/contacts/import", bytes.NewReader(payload))
-		req.Header.Set("Content-Type", "application/json")
-
-		resp, err := client.Do(req)
-		if err != nil {
+	payload, err := json.Marshal(contacts)
+	if err != nil {
+		b.Fatal(err)
+	}
+	for b.Loop() {
+		if err := benchmarkRequest(client, http.MethodPost, "/api/contacts/import", bytes.NewReader(payload), "", http.StatusOK); err != nil {
 			b.Fatal(err)
 		}
-		io.Copy(io.Discard, resp.Body)
-		resp.Body.Close()
-	}
-}
-
-func BenchmarkDownloadFile(b *testing.B) {
-	files, _ := testStore.ListFiles(context.Background())
-	if len(files) == 0 {
-		b.Fatal("no files")
-	}
-	id := files[0].ID
-
-	client := &http.Client{}
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		req := authedRequest("GET", "/api/files/"+id, nil)
-		resp, err := client.Do(req)
-		if err != nil {
-			b.Fatal(err)
-		}
-		io.Copy(io.Discard, resp.Body)
-		resp.Body.Close()
 	}
 }
 
 func BenchmarkUploadFile(b *testing.B) {
-	client := &http.Client{}
+	client := benchmarkClient(b)
 	content := bytes.Repeat([]byte("x"), 1024*1024) // 1MB
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		var buf bytes.Buffer
 		w := multipart.NewWriter(&buf)
-		fw, _ := w.CreateFormFile("file", "test.bin")
-		fw.Write(content)
-		w.Close()
-
-		req := authedRequest("POST", "/api/files", &buf)
-		req.Header.Set("Content-Type", w.FormDataContentType())
-
-		resp, err := client.Do(req)
+		fw, err := w.CreateFormFile("file", "test.bin")
 		if err != nil {
 			b.Fatal(err)
 		}
-		io.Copy(io.Discard, resp.Body)
-		resp.Body.Close()
-	}
-}
-
-func BenchmarkActivityReport(b *testing.B) {
-	client := &http.Client{}
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		req := authedRequest("GET", "/api/reports/activity", nil)
-		resp, err := client.Do(req)
-		if err != nil {
+		if _, err := fw.Write(content); err != nil {
 			b.Fatal(err)
 		}
-		io.Copy(io.Discard, resp.Body)
-		resp.Body.Close()
+		if err := w.Close(); err != nil {
+			b.Fatal(err)
+		}
+		if err := benchmarkRequest(client, http.MethodPost, "/api/files", &buf, w.FormDataContentType(), http.StatusCreated); err != nil {
+			b.Fatal(err)
+		}
 	}
-}
-
-// Parallel benchmarks
-
-func BenchmarkListContactsParallel(b *testing.B) {
-	b.RunParallel(func(pb *testing.PB) {
-		client := &http.Client{}
-		for pb.Next() {
-			req := authedRequest("GET", "/api/contacts?limit=50", nil)
-			resp, err := client.Do(req)
-			if err != nil {
-				b.Fatal(err)
-			}
-			io.Copy(io.Discard, resp.Body)
-			resp.Body.Close()
-		}
-	})
-}
-
-func BenchmarkGetContactParallel(b *testing.B) {
-	contacts, _ := testStore.ListContacts(context.Background(), 1, nil)
-	if len(contacts) == 0 {
-		b.Fatal("no contacts")
-	}
-	id := contacts[0].ID
-
-	b.RunParallel(func(pb *testing.PB) {
-		client := &http.Client{}
-		for pb.Next() {
-			req := authedRequest("GET", "/api/contacts/"+id, nil)
-			resp, err := client.Do(req)
-			if err != nil {
-				b.Fatal(err)
-			}
-			io.Copy(io.Discard, resp.Body)
-			resp.Body.Close()
-		}
-	})
-}
-
-func BenchmarkCreateContactParallel(b *testing.B) {
-	b.RunParallel(func(pb *testing.PB) {
-		client := &http.Client{}
-		for pb.Next() {
-			body := bytes.NewBufferString(`{
-				"first_name": "Test",
-				"last_name": "User",
-				"email": "test@example.com",
-				"phone": "555-1234",
-				"company": "Test Corp"
-			}`)
-			req := authedRequest("POST", "/api/contacts", body)
-			req.Header.Set("Content-Type", "application/json")
-
-			resp, err := client.Do(req)
-			if err != nil {
-				b.Fatal(err)
-			}
-			io.Copy(io.Discard, resp.Body)
-			resp.Body.Close()
-		}
-	})
-}
-
-func BenchmarkExportContactsParallel(b *testing.B) {
-	b.RunParallel(func(pb *testing.PB) {
-		client := &http.Client{}
-		for pb.Next() {
-			req := authedRequest("GET", "/api/contacts/export", nil)
-			resp, err := client.Do(req)
-			if err != nil {
-				b.Fatal(err)
-			}
-			io.Copy(io.Discard, resp.Body)
-			resp.Body.Close()
-		}
-	})
-}
-
-func BenchmarkDownloadFileParallel(b *testing.B) {
-	files, _ := testStore.ListFiles(context.Background())
-	if len(files) == 0 {
-		b.Fatal("no files")
-	}
-	id := files[0].ID
-
-	b.RunParallel(func(pb *testing.PB) {
-		client := &http.Client{}
-		for pb.Next() {
-			req := authedRequest("GET", "/api/files/"+id, nil)
-			resp, err := client.Do(req)
-			if err != nil {
-				b.Fatal(err)
-			}
-			io.Copy(io.Discard, resp.Body)
-			resp.Body.Close()
-		}
-	})
-}
-
-func BenchmarkActivityReportParallel(b *testing.B) {
-	b.RunParallel(func(pb *testing.PB) {
-		client := &http.Client{}
-		for pb.Next() {
-			req := authedRequest("GET", "/api/reports/activity", nil)
-			resp, err := client.Do(req)
-			if err != nil {
-				b.Fatal(err)
-			}
-			io.Copy(io.Discard, resp.Body)
-			resp.Body.Close()
-		}
-	})
 }

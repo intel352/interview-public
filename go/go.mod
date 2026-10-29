@@ -1,6 +1,6 @@
 module github.com/weave-lab/interview-public/go
 
-go 1.26.3
+go 1.27.3
 
 require (
 	github.com/brianvoe/gofakeit/v7 v7.15.0
