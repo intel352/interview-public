@@ -2,7 +2,7 @@
 
 The request limiter remains independent middleware. The broader Go changes cover
 actor ownership, HTTP/resource boundaries, storage consistency and lifecycle.
-Java is unchanged. See [compatibility review](COMPATIBILITY.md) for behavior
+See [compatibility review](COMPATIBILITY.md) for behavior
 changes from the starter and [API testing](API_TESTING.md) for scenario evidence.
 
 ## Local actors and ownership
@@ -46,7 +46,7 @@ outcomes. Count, period and capacity are startup flags; larger capacity permits
 bursts. Invalid settings fail before resources open. Rejected requests return
 non-cacheable JSON `429` and rounded-up `Retry-After` until one more request fits.
 It limits admissions, not concurrent in-flight handlers or fairness. See the
-[configuration contract](../README.md#request-limiting-go) for precision and bounds.
+[configuration contract](../README.md#request-limiting) for precision and bounds.
 
 Both servers set 5-second header, 30-second read/write/request and 60-second idle
 deadlines, with a 16 KiB header limit. The write budget includes body reading.

@@ -28,7 +28,7 @@ Dedicated tests wrap that router in the actual global limiter with a synchronize
 injected clock. CLI/server scenarios exercise actual listeners and production
 wiring, including configurable limiting, the separate health listener and
 shutdown. Clock injection is not exposed as a production API. Rate, period and
-capacity use startup flags; see [configuration semantics](../README.md#request-limiting-go).
+capacity use startup flags; see [configuration semantics](../README.md#request-limiting).
 
 The suite deliberately uses several test layers:
 
@@ -152,7 +152,7 @@ precision. Neither live pagination nor CSV is a transactional backup snapshot.
 
 ## Explicit limits
 
-This suite does not test Java, production identity provisioning, external account
+This suite does not test production identity provisioning, external account
 permissions, OS administrator isolation, every malformed byte sequence, indefinite
 load, every network/filesystem failure, or power-loss recovery across SQLite and
 files. Exact JSON body and stored-file size boundaries are tested below the

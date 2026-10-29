@@ -3,8 +3,8 @@
 The comparison baseline is upstream `d35ce33`. The earlier published hardening
 head was `02ae9b0`. This table distinguishes requested behavior, intentional
 restrictions and corrected regressions. It does not claim that observed defects
-were deliberate interviewer traps. Java remains unchanged and its shared schema
-is not interchangeable with the current Go ownership schema.
+were deliberate interviewer traps. The original shared schema is not
+interchangeable with the current ownership schema.
 
 | Contract | Original / earlier behavior | Current decision and classification |
 |---|---|---|
@@ -13,7 +13,7 @@ is not interchangeable with the current Go ownership schema.
 | Reports | Original reports aggregated all actors. | **Chosen privacy policy supporting the requested actor isolation:** callers see only their actor's report; multiple actor attribution survives in actual database rows. No cross-actor admin API is implied. |
 | Audit action names | Original `export`, `download`, `view`; earlier hardening renamed them with `_attempt`. | **Corrected introduced compatibility regression:** original names are restored. Delivery actions are recorded before output; the names describe attempted operations, not proof of complete delivery. Failed validation, authorization and missing resources do not add successful-operation audits. |
 | Health | Original API listener served `/health`; initial limiter also charged it. | **User-requested separation:** health has its own loopback listener, default API port + 1, and bypasses the business limiter. Each listener exposes only its own routes. |
-| Limiter | New assignment behavior; initially fixed at 10/minute and capacity one. | **Assignment defaults preserved:** process-global leaky bucket, one admission per six seconds. **Later user-requested configuration:** count, period and capacity flags; larger capacity permits bursts and changes the strict spacing policy. Immediate rejection, pre-auth business scope and health exemption remain. Invalid settings fail before resources open; no per-actor fairness or distributed state is added. See [scope rationale](SCOPE.md) and [configuration](../README.md#request-limiting-go). |
+| Limiter | New assignment behavior; initially fixed at 10/minute and capacity one. | **Assignment defaults preserved:** process-global leaky bucket, one admission per six seconds. **Later user-requested configuration:** count, period and capacity flags; larger capacity permits bursts and changes the strict spacing policy. Immediate rejection, pre-auth business scope and health exemption remain. Invalid settings fail before resources open; no per-actor fairness or distributed state is added. See [scope rationale](SCOPE.md) and [configuration](../README.md#request-limiting). |
 | Empty responses | Original contact/file slices encoded as `null`; reports as `[]`. | **Intentional contract fix:** all empty collections are arrays; contact list still uses its `contacts` envelope. |
 | PUT | Original replaced omitted fields with empty values. | **Preserved:** full replacement, not PATCH. Tests include omission behavior. |
 | Contact input DTO | Original full GET objects could be PUT/imported, with server IDs overwritten; unknown/duplicate/case-folded/null fields were permissive. | **Explicit stricter contract:** only five exact writable string fields; no duplicates/nulls/unknown fields or metadata. GET→PUT requires projection. This is a documented compatibility restriction, not a claim that rejecting every metadata field is required for ownership security. |

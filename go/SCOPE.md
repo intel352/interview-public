@@ -64,7 +64,7 @@ Evidence: [server](cmd/server/main.go), [health router](internal/app/health.go),
 
 ## Expanded tooling, tests and documentation
 
-- **E · Go 1.27.3/modernization:** explicitly requested upgrade from 1.26.3 and supported built-in modernization; keeps the chosen toolchain current. Earlier mechanical changes can be superseded by later redesigns; dependencies and Java were not upgraded.
+- **E · Go 1.27.3/modernization:** explicitly requested upgrade from 1.26.3 and supported built-in modernization; keeps the chosen toolchain current. Earlier mechanical changes can be superseded by later redesigns; dependencies were not upgraded.
 - **S/E · Test/benchmark lifecycle:** return before `os.Exit` so cleanup runs; check close/status/body-I/O errors, bound clients and use benchmark helpers/`B.Loop`. Makes results trustworthy; all 14 benchmark workloads remain, but mutation benchmarks grow disposable data.
 - **E · Full-app BDD/API workflow:** explicitly requested endpoint coverage and convenient testing; native Go/Make targets use generated credentials, actual HTTP/SQLite/files and an explicit matrix. No BDD framework or CI workflow was added; ordinary tests do not run benchmarks.
 - **E · Test realism:** exact persisted fields/owners/audit tuples, HTTP operations→reports, usable rotated tokens, symmetric isolation, real interrupted bodies/cancellation and rollback/retry; closes gaps that status/count-only assertions missed.
